@@ -5,10 +5,11 @@ import useSWR from 'swr';
 
 import { explorerTx } from '@/lib/config';
 import { humaniseError, REGISTRY_ERRORS, VOUCHER_ERRORS } from '@/lib/errors';
+import { formatUsdc, toAmountInput, toBaseUnits } from '@/lib/amounts';
 import { registry, voucher } from '@/lib/protocol';
 import { useWallet } from '@/lib/wallet';
 import { useToast } from '@/components/Toast';
-import { Button, Card, Empty, ExplorerLink } from '@/components/ui';
+import { Button, Card, Empty, ExplorerLink, Modal } from '@/components/ui';
 
 type ContractKind = 'registry' | 'voucher';
 
@@ -96,6 +97,12 @@ export default function AdminPage() {
           toast={toast}
         />
       ))}
+
+      <VoucherRiskLimits
+        address={address}
+        signTransaction={signTransaction}
+        toast={toast}
+      />
     </div>
   );
 }
@@ -246,6 +253,278 @@ function AdminContractCard({
           </Button>
         </div>
       )}
+    </Card>
+  );
+}
+
+function VoucherRiskLimits({
+  address,
+  signTransaction,
+  toast,
+}: {
+  address: string | null;
+  signTransaction: (xdr: string) => Promise<string>;
+  toast: ReturnType<typeof useToast>;
+}) {
+  const adminKey = ['admin', 'voucher'];
+  const { data: admin } = useSWR(adminKey, () => voucher.getAdmin());
+  const isAdmin =
+    !!address && !!admin && address.toLowerCase() === admin.toLowerCase();
+
+  const { data: attCap, mutate: mutateAtt } = useSWR('attestation-cap', () =>
+    voucher.getAttestationCap(),
+  );
+  const { data: escrowCap, mutate: mutateEscrow } = useSWR(
+    'escrow-cap',
+    () => voucher.getMaxEscrowPerProvider(),
+  );
+
+  const [attDraft, setAttDraft] = useState('');
+  const [escrowDraft, setEscrowDraft] = useState('');
+  const [attError, setAttError] = useState<string | null>(null);
+  const [escrowError, setEscrowError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<'att' | 'escrow' | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  function validateAtt(value: string): string | null {
+    const trimmed = value.trim();
+    if (!/^\d+$/.test(trimmed)) return 'Enter a whole number.';
+    const n = Number(trimmed);
+    if (!Number.isSafeInteger(n) || n <= 0)
+      return 'Must be a positive whole number.';
+    return null;
+  }
+
+  function validateEscrow(value: string): string | null {
+    const trimmed = value.trim();
+    try {
+      const base = toBaseUnits(trimmed);
+      if (base <= 0n) return 'Must be greater than zero.';
+    } catch {
+      return 'Enter a valid USDC amount.';
+    }
+    return null;
+  }
+
+  async function confirmAtt() {
+    if (!address) return;
+    const err = validateAtt(attDraft);
+    setAttError(err);
+    if (err) return void setConfirming(null);
+    setBusy(true);
+    try {
+      const res = await voucher.setAttestationCap(
+        address,
+        Number(attDraft.trim()),
+        signTransaction,
+      );
+      await mutateAtt();
+      toast.success(
+        <>
+          Attestation cap updated.{' '}
+          <ExplorerLink href={explorerTx(res.hash)}>View transaction</ExplorerLink>
+        </>,
+      );
+      setConfirming(null);
+      setAttDraft('');
+    } catch (err) {
+      toast.error(humaniseError(err, VOUCHER_ERRORS));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirmEscrow() {
+    if (!address) return;
+    const err = validateEscrow(escrowDraft);
+    setEscrowError(err);
+    if (err) return void setConfirming(null);
+    setBusy(true);
+    try {
+      const base = toBaseUnits(escrowDraft.trim());
+      const res = await voucher.setMaxEscrowPerProvider(
+        address,
+        base,
+        signTransaction,
+      );
+      await mutateEscrow();
+      toast.success(
+        <>
+          Escrow cap updated.{' '}
+          <ExplorerLink href={explorerTx(res.hash)}>View transaction</ExplorerLink>
+        </>,
+      );
+      setConfirming(null);
+      setEscrowDraft('');
+    } catch (err) {
+      toast.error(humaniseError(err, VOUCHER_ERRORS));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card className="space-y-4 p-5">
+      <div>
+        <h2 className="font-medium">Voucher risk limits</h2>
+        <p className="mt-1 text-sm text-[var(--color-ink-soft)]">
+          Protocol risk limits enforced by the voucher contract. Only the
+          current administrator can change them.
+        </p>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div>
+          <div className="text-xs text-[var(--color-ink-soft)]">
+            Daily attestation cap
+          </div>
+          <div className="mt-1 text-sm">
+            {attCap === undefined ? 'Loading…' : `${attCap} attestations / day`}
+          </div>
+          <p className="mt-1 text-xs text-[var(--color-ink-soft)]">
+            Maximum number of vouchers an attester may confirm per day.
+          </p>
+        </div>
+        <div>
+          <div className="text-xs text-[var(--color-ink-soft)]">
+            Per-clinic escrow cap
+          </div>
+          <div className="mt-1 text-sm">
+            {escrowCap === undefined
+              ? 'Loading…'
+              : `${formatUsdc(escrowCap)} USDC`}
+          </div>
+          <p className="mt-1 text-xs text-[var(--color-ink-soft)]">
+            Maximum total value held in escrow for any single clinic at once.
+          </p>
+        </div>
+      </div>
+
+      {isAdmin && (
+        <div className="space-y-4">
+          <div className="space-y-2">
+            <div className="text-sm font-medium">Daily attestation cap</div>
+            <div className="flex flex-wrap gap-2">
+              <input
+                value={attDraft}
+                onChange={(e) => {
+                  setAttDraft(e.target.value);
+                  setAttError(validateAtt(e.target.value));
+                }}
+                placeholder={
+                  attCap === undefined ? 'Loading…' : String(attCap)
+                }
+                className="min-w-[16rem] flex-1 rounded-lg border border-[var(--color-line)] px-3 py-2 text-sm"
+              />
+              <Button
+                disabled={busy || !attDraft.trim() || !!validateAtt(attDraft)}
+                onClick={() => {
+                  const err = validateAtt(attDraft);
+                  setAttError(err);
+                  if (!err) setConfirming('att');
+                }}
+              >
+                Update attestation cap
+              </Button>
+            </div>
+            {attError && (
+              <p className="text-xs text-red-600">{attError}</p>
+            )}
+          </div>
+
+          <div className="space-y-2">
+            <div className="text-sm font-medium">Per-clinic escrow cap</div>
+            <div className="flex flex-wrap gap-2">
+              <input
+                value={escrowDraft}
+                onChange={(e) => {
+                  setEscrowDraft(e.target.value);
+                  setEscrowError(validateEscrow(e.target.value));
+                }}
+                placeholder={
+                  escrowCap === undefined
+                    ? 'Loading…'
+                    : toAmountInput(escrowCap)
+                }
+                className="min-w-[16rem] flex-1 rounded-lg border border-[var(--color-line)] px-3 py-2 text-sm"
+              />
+              <Button
+                disabled={
+                  busy || !escrowDraft.trim() || !!validateEscrow(escrowDraft)
+                }
+                onClick={() => {
+                  const err = validateEscrow(escrowDraft);
+                  setEscrowError(err);
+                  if (!err) setConfirming('escrow');
+                }}
+              >
+                Update escrow cap
+              </Button>
+            </div>
+            {escrowError && (
+              <p className="text-xs text-red-600">{escrowError}</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {!address && (
+        <p className="text-sm text-[var(--color-ink-soft)]">
+          Connect the administrator wallet to change these limits.
+        </p>
+      )}
+
+      <Modal
+        open={confirming === 'att'}
+        onClose={() => {
+          if (!busy) setConfirming(null);
+        }}
+        title="Update daily attestation cap"
+        actions={
+          <>
+            <Button disabled={busy} onClick={() => void confirmAtt()}>
+              {busy ? 'Confirming…' : 'Confirm'}
+            </Button>
+            <Button
+              variant="ghost"
+              disabled={busy}
+              onClick={() => setConfirming(null)}
+            >
+              Cancel
+            </Button>
+          </>
+        }
+      >
+        <p className="text-sm">
+          Set the daily attestation cap to {attDraft}?
+        </p>
+      </Modal>
+
+      <Modal
+        open={confirming === 'escrow'}
+        onClose={() => {
+          if (!busy) setConfirming(null);
+        }}
+        title="Update per-clinic escrow cap"
+        actions={
+          <>
+            <Button disabled={busy} onClick={() => void confirmEscrow()}>
+              {busy ? 'Confirming…' : 'Confirm'}
+            </Button>
+            <Button
+              variant="ghost"
+              disabled={busy}
+              onClick={() => setConfirming(null)}
+            >
+              Cancel
+            </Button>
+          </>
+        }
+      >
+        <p className="text-sm">
+          Set the per-clinic escrow cap to {escrowDraft} USDC?
+        </p>
+      </Modal>
     </Card>
   );
 }
