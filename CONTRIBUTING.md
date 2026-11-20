@@ -3,6 +3,8 @@
 The web app for funders, clinics and attesters. Next.js 16, React 19,
 Tailwind 4, TypeScript.
 
+By taking part you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Setup
 
 Use Node 22 (`nvm use` reads `.nvmrc`). Its bundled npm 10 is what CI runs;
@@ -15,7 +17,9 @@ npm run dev
 ```
 
 You also need the backend running on `http://localhost:8080` and contract ids
-from a deployment. See `sci-healthcare-contracts/README.md`.
+from a deployment. See `sci-healthcare-contracts/README.md`. For the whole
+stack — backend, contract ids and `.env.local` — follow
+[`docs/running-locally.md`](docs/running-locally.md).
 
 ```bash
 npm run typecheck
@@ -26,6 +30,21 @@ npm run build
 `NEXT_PUBLIC_*` values first and stops with an itemised message when one is
 missing (see `next.config.ts`, #76). Fill in `.env.local` before building —
 `next dev` and Storybook are not affected by that check.
+
+## Architecture
+
+The map lives in [`docs/architecture.md`](docs/architecture.md). It covers the
+layers of the app — pages, providers, hooks, the API client, the contract
+wrappers, the wallet and the offline shell — and ends with the behaviours that
+surprise people reading the code for the first time. Read it before changing
+anything that crosses a layer: the SWR cache keys, the write path and the
+service worker's rules are all written down there.
+
+Two sentences it makes concrete, and that the rest of this file depends on:
+**reads go to the indexer over HTTP, and writes go from the browser straight
+to Soroban RPC.** Optional testnet fee sponsorship adds a sign-only backend
+round trip before browser submission; see [the sponsor contract](docs/sponsored-fees.md).
+The sponsor never receives a wallet key and must not submit transactions.
 
 ## Non-negotiables
 
@@ -59,6 +78,53 @@ missing (see `next.config.ts`, #76). Fill in `.env.local` before building —
 - Prefer explaining the mechanism over reassuring the user. "Dispute window
   closes in 3h — settles after that" beats "Processing".
 
+## Forking, Codespaces and pushing
+
+Only maintainers can push to this repository, and `main` takes changes through
+pull requests only. If `git push` answers `403` or `Permission denied`, the
+push is going to `Godgift-care/sci-healthcare-frontend` instead of your fork.
+
+1. Fork the repository, then clone **your fork**
+   (`gh repo fork Godgift-care/sci-healthcare-frontend --clone` does both).
+2. Create a branch, commit, and `git push -u origin <branch>`.
+3. Open a pull request against `main`.
+
+**GitHub Codespaces.** The repository has a [dev container](.devcontainer/), so
+a codespace starts with the toolchain CI uses and the dependencies installed.
+Create it from your fork (**Code → Codespaces** on your fork's page) and
+`git push` works as usual. A codespace created from this repository without
+write access cannot push here; GitHub offers to fork it for you on the first
+push, or run `gh repo fork --remote` and push to the new `origin`.
+
+A codespace cannot push changes to `.github/workflows/`: its token has no
+workflow permission. Make those changes from a local clone.
+
+**The API URL in a codespace.** The dev container runs
+`node scripts/codespace-env.mjs` after `npm ci`, which writes `.env.local`
+with `NEXT_PUBLIC_API_URL` pointing at the deployed testnet API
+(`https://sci-healthcare-api.onrender.com`). That address is reachable from
+your browser, unlike the container's `localhost:8080`, and the CSP follows the
+same variable, so no other change is needed. Restart `npm run dev` after the
+script runs, since Next reads `.env.local` once at start-up.
+
+To use a backend running in *another* codespace instead, forward its port
+publicly (**Ports** tab → the 8080 port → *Public*) and run:
+
+```bash
+SCI_BACKEND_CODESPACE=<that-codespace-name> node scripts/codespace-env.mjs --force
+```
+
+which writes `https://<that-codespace-name>-8080.app.github.dev`. Any other
+absolute URL works too: `SCI_API_URL=https://api.example.com node
+scripts/codespace-env.mjs --force`. A value you set by hand is left alone on
+later runs unless it is still `localhost`.
+
+Never commit a `.env` file, and never commit files you did not write. If
+`git status` shows changes you do not recognise (an `init` file, edited
+`package.json` scripts, a changed `.gitignore`, config files with one very long
+line), stop and check your machine before pushing: see
+[Security scan](#security-scan).
+
 ## Commits and PRs
 
 ```
@@ -82,9 +148,19 @@ A bot merges pull requests automatically (squash) as soon as every CI check on t
 - is not a draft and has no `do-not-merge` label,
 - links the issue you were assigned on Drips Wave, with a line such as `Closes #123` in the description (Wave points are awarded when that issue is closed as completed, which the bot does on merge),
 - has no merge conflicts and is up to date with `main` (the bot comments if it is behind),
+- passes the security scan (the `security-scan` status, see below),
 - and, if it changes anything under `.github/` (CI workflows and repository automation), has been approved by a maintainer. The bot comments with the files that need approval.
 
 So open your pull request as a draft until it is ready, and keep CI green. To stop an automatic merge, add the `do-not-merge` label or convert the pull request back to a draft.
+
+### Security scan
+
+Every pull request is scanned for malicious changes before it can be merged. The scan runs from `main`, reads your changes as data and never runs them. It reports on the pull request as the `security-scan` status and, if anything needs attention, in a comment listing each finding.
+
+- **block** findings are never merged automatically. Examples are executables and unexpected binaries, hidden or bidirectional Unicode characters (Trojan Source), crypto miners, reverse shells, piping a download into a shell, reading credential files, dependencies from git URLs, tarballs or paths outside the repository, look-alike (typosquatted) package names, packages that do not exist on npm, lockfile entries from another registry or without an integrity hash, crates from outside crates.io, and packages listed as malware in the OSV database.
+- **review** findings are common in legitimate work but also how malware gets in. Examples are new dependencies that are recent or rarely used, changed npm scripts, `eval` and spawned processes, encoded or minified code, new network hosts or Stellar addresses, shell scripts, and security-sensitive files. A maintainer reads the change and adds the `security-reviewed` label, after which it merges as usual. A new push removes the label, so the latest commit is always the one reviewed.
+
+If a finding is a false positive, say so on the pull request; please do not try to reword code to get past the scan.
 
 ## Wave program
 

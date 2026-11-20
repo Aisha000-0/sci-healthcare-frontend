@@ -1,3 +1,5 @@
+import { formatRelativeFromNow } from '@/i18n/translate';
+
 /**
  * Amounts are i128 on chain and are carried as decimal strings in the UI.
  * Parsing one into a JS number loses precision above 2^53, so this module
@@ -16,8 +18,53 @@ export function toBaseUnits(display: string): bigint {
   return BigInt(whole) * SCALE + BigInt(padded || '0');
 }
 
+export function validateAmountInput(display: string, minimum: bigint): string | null {
+  const trimmed = display.trim();
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return 'Enter a valid amount.';
+
+  const [, fraction = ''] = trimmed.split('.');
+  if (fraction.length > DECIMALS) {
+    return `Use no more than ${DECIMALS} decimal places.`;
+  }
+
+  if (toBaseUnits(trimmed) < minimum) {
+    return `The listed price is $${formatUsdc(minimum)}. Enter at least that.`;
+  }
+
+  return null;
+}
+
 /** Formats base units for display, trimming trailing zeros to 2dp minimum. */
-export function formatUsdc(base: string | bigint): string {
+export function formatUsdc(base: string | bigint, locale = 'en'): string {
+  const value = typeof base === 'bigint' ? base : BigInt(base);
+  const whole = value / SCALE;
+  const frac = (value % SCALE).toString().padStart(DECIMALS, '0');
+  const trimmed = frac.replace(/0+$/, '').padEnd(2, '0');
+  const localeTag =
+    locale === 'fr'
+      ? 'fr-FR'
+      : locale === 'sw'
+        ? 'sw-KE'
+        : locale === 'yo'
+          ? 'yo-NG'
+          : 'en-US';
+  return `${whole.toLocaleString(localeTag)}.${trimmed}`;
+}
+
+/** Formats an amount with currency symbol or code according to the given locale */
+export function formatCurrency(
+  base: string | bigint,
+  currency = 'USD',
+  locale = 'en',
+): string {
+  const formatted = formatUsdc(base, locale);
+  if (locale === 'fr') {
+    return `${formatted} ${currency}`;
+  }
+  return `$${formatted}`;
+}
+
+export function formatXlm(base: string | bigint): string {
   const value = typeof base === 'bigint' ? base : BigInt(base);
   const whole = value / SCALE;
   const frac = (value % SCALE).toString().padStart(DECIMALS, '0');
@@ -31,7 +78,7 @@ export function formatUsdc(base: string | bigint): string {
  * digits ("1,000.00"), which `toBaseUnits` rightly rejects.
  */
 export function toAmountInput(base: string | bigint): string {
-  return formatUsdc(base).replaceAll(',', '');
+  return formatUsdc(base, 'en').replaceAll(',', '');
 }
 
 export function shortAddress(addr: string, chars = 4): string {
@@ -39,30 +86,63 @@ export function shortAddress(addr: string, chars = 4): string {
   return `${addr.slice(0, chars)}…${addr.slice(-chars)}`;
 }
 
-export function formatDate(iso: string | Date | null): string {
+export function formatDate(iso: string | Date | null, locale = 'en'): string {
   if (!iso) return '—';
   const d = typeof iso === 'string' ? new Date(iso) : iso;
-  return d.toLocaleDateString('en-GB', {
+  const localeTag =
+    locale === 'fr'
+      ? 'fr-FR'
+      : locale === 'sw'
+        ? 'sw-KE'
+        : locale === 'yo'
+          ? 'yo-NG'
+          : 'en-GB';
+  return d.toLocaleDateString(localeTag, {
     day: 'numeric',
     month: 'short',
     year: 'numeric',
   });
 }
 
-export function timeUntil(iso: string | Date | null, now?: number | Date | null): string {
+function nowMs(now?: number | Date | null): number {
+  return now != null && (typeof now !== 'number' || now > 0)
+    ? typeof now === 'number'
+      ? now
+      : now.getTime()
+    : Date.now();
+}
+
+/**
+ * Relative time to a future (or past) timestamp, in the active locale
+ * (#278). `Intl.RelativeTimeFormat` supplies the wording and the plural
+ * rules, so English reads "in 3 days" and French "dans 3 jours" without
+ * concatenating a number and a suffix.
+ */
+export function timeUntil(
+  iso: string | Date | null,
+  now?: number | Date | null,
+  locale = 'en',
+): string {
   if (!iso) return '—';
   const d = typeof iso === 'string' ? new Date(iso) : iso;
-  const currentMs =
-    now != null && (typeof now !== 'number' || now > 0)
-      ? typeof now === 'number'
-        ? now
-        : now.getTime()
-      : Date.now();
-  const ms = d.getTime() - currentMs;
-  if (ms <= 0) return 'now';
-  const mins = Math.floor(ms / 60000);
-  if (mins < 60) return `${mins}m`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h`;
-  return `${Math.floor(hours / 24)}d`;
+  const current = nowMs(now);
+  // A deadline that has already passed reads "now" rather than "3 days
+  // ago": the useful fact is that it is due, not how overdue it is.
+  return formatRelativeFromNow(Math.max(d.getTime(), current), current, locale);
+}
+
+/**
+ * Elapsed time since a timestamp, in the active locale ("2 hours ago").
+ * A difference under a minute reads "now".
+ */
+export function timeSince(
+  iso: string | Date | null,
+  now?: number | Date | null,
+  locale = 'en',
+): string {
+  if (!iso) return '—';
+  const d = typeof iso === 'string' ? new Date(iso) : iso;
+  const current = nowMs(now);
+  // Never report a future "claimed" time as being in the future.
+  return formatRelativeFromNow(Math.min(d.getTime(), current), current, locale);
 }

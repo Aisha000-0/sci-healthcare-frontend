@@ -1,0 +1,26 @@
+{
+  // Pins Codespaces to the Node version in .nvmrc. Without this the default
+  // image picks its own Node, which is the usual reason `npm ci` fails here
+  // but passes in CI.
+  "name": "sci-healthcare-frontend",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:1-22-bookworm",
+
+  // The GitHub CLI, for `gh repo fork` and `gh pr create` from a codespace.
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  // .env.local from the example, so `npm run dev` starts without setup. The
+  // script also points NEXT_PUBLIC_API_URL at an API the browser outside the
+  // container can reach (#371); outside Codespaces it does nothing.
+  "postCreateCommand": "npm ci && node scripts/codespace-env.mjs",
+
+  // 3000 is `next dev`; 6006 is Storybook.
+  "forwardPorts": [3000, 6006],
+
+  "customizations": {
+    "vscode": {
+      "extensions": ["dbaeumer.vscode-eslint"]
+    }
+  }
+}

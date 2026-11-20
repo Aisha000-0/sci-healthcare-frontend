@@ -1,23 +1,26 @@
 'use client';
 
 import Link from 'next/link';
-import { useState } from 'react';
+import { DetailLink } from '@/components/DetailLink';
+import { useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
 
-import type { Voucher } from '@/lib/api';
-import { formatDate, formatUsdc, timeUntil } from '@/lib/amounts';
+import { api, type Voucher } from '@/lib/api';
+import { formatDate, formatUsdc, timeUntil, timeSince, toAmountInput } from '@/lib/amounts';
 import { trackEvent, type AnalyticsEvent } from '@/lib/analytics';
 import { explorerTx } from '@/lib/config';
 import { DISPUTE_REASONS, disputeReasonLabel, type DisputeReasonCode } from '@/lib/disputes';
 import { humaniseError } from '@/lib/errors';
 import { invalidateVouchers, useNow } from '@/lib/hooks';
 import { voucher as protocol } from '@/lib/protocol';
+import { EXPECTED_STATUS, pollVoucherStatus } from '@/lib/reconcile';
 import { useWallet } from '@/lib/wallet';
+import { useLocaleContext } from '@/i18n/LocaleContext';
 
 import { Button, Card, ExplorerLink, InfoTip, Modal, StatusBadge } from './ui';
 import { AddressName } from './AddressName';
 import { useToast } from './Toast';
-
-type Action = 'claim' | 'attest' | 'settle' | 'refund' | 'dispute';
+import { VerifyPatient } from './VerifyPatient';
+import { availableActions, type VoucherAction as Action } from '@/lib/voucher-actions';
 
 /** Funnel step per contract write. Names only — never any properties. */
 const ACTION_EVENTS = {
@@ -28,33 +31,84 @@ const ACTION_EVENTS = {
   refund: 'voucher_refunded',
 } as const satisfies Record<Action, AnalyticsEvent>;
 
+/** Returns true if the deadline is within 48 hours. */
+function isUrgent(iso: string | Date | null, now: number): boolean {
+  if (!iso) return false;
+  const d = typeof iso === 'string' ? new Date(iso) : iso;
+  const ms = d.getTime() - now;
+  return ms > 0 && ms <= 48 * 60 * 60 * 1000;
+}
+
+/**
+ * Lets a list drive a row from the keyboard (#160). `startAttest` opens the
+ * same confirmation modal the button does — it never submits on its own —
+ * and returns false when attesting is not on offer right now.
+ */
+export type VoucherRowHandle = { startAttest: () => boolean };
+
 export function VoucherRow({
   v,
   actions,
   onDone,
   summary = true,
+  now: nowProp,
+  disabled = false,
+  ref,
+  requirePatientMatch = false,
 }: {
   v: Voucher;
   actions: Action[];
   onDone?: () => void;
   /** False on the voucher's own page, which already shows the summary. */
   summary?: boolean;
+  /** Optional current time in ms (e.g., from parent using useNow). Falls back to internal useNow. */
+  now?: number;
+  /**
+   * True while the page is settling several vouchers: the batch is already
+   * writing, so a second write on the same row would only fail.
+   */
+  disabled?: boolean;
+  ref?: Ref<VoucherRowHandle>;
+  /**
+   * Hold the claim button until the patient's reference and key match this
+   * voucher (#33). Off by default: the check is still offered, but a clinic
+   * can claim without it. Point-of-care desks pass `true`.
+   */
+  requirePatientMatch?: boolean;
 }) {
   const { address, signTransaction, connect } = useWallet();
-  const now = useNow();
+  const { t } = useLocaleContext();
+  const nowInternal = useNow();
+  const now = nowProp ?? nowInternal;
+  const { locale } = useLocaleContext();
   const toast = useToast();
   const [busy, setBusy] = useState<Action | null>(null);
+  // After a write the chain has moved but the indexer lags (#9): while
+  // polling, the row shows a pending state instead of the stale status.
+  const [reconciling, setReconciling] = useState<Action | null>(null);
+  // Transaction hash when the indexer never caught up in time.
+  const [staleTx, setStaleTx] = useState<string | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => () => {
+    mounted.current = false;
+  }, []);
   // Disputing freezes funds, so it takes a reason and a confirmation modal.
   // Attesting pays the clinic after the dispute window, so it confirms too.
   const [disputing, setDisputing] = useState(false);
   const [attesting, setAttesting] = useState(false);
   const [reason, setReason] = useState<DisputeReasonCode>(DISPUTE_REASONS[0].code);
+  // Patient check (#33): keep which voucher matched, never the typed values.
+  // Keying the match by voucher means a changed row cannot inherit a match.
+  const [verifying, setVerifying] = useState(false);
+  const [verifiedFor, setVerifiedFor] = useState<string | null>(null);
+  const verificationKey = `${v.id}:${v.beneficiaryRef}`;
+  const patientVerified = verifiedFor === verificationKey;
 
   async function run(action: Action) {
     if (!address) return void connect();
     setBusy(action);
     try {
-      const fns: Record<Action, () => Promise<{ hash: string }>> = {
+      const fns: Record<Action, () => Promise<{ hash: string; queued?: boolean }>> = {
         claim: () => protocol.claim(address, v.id, signTransaction),
         attest: () => protocol.attest(address, v.id, signTransaction),
         settle: () => protocol.settle(address, v.id, signTransaction),
@@ -64,39 +118,80 @@ export function VoucherRow({
       const res = await fns[action]();
       setDisputing(false);
       setAttesting(false);
+      // A claim made without a connection is signed and queued (#301). It
+      // has not reached the chain yet, so there is nothing for the indexer
+      // to catch up to; the queue on the desk reports it instead.
+      if (res.queued) {
+        setBusy(null);
+        onDone?.();
+        toast.success(t('offlineQueue.queuedToast'));
+        return;
+      }
       trackEvent(ACTION_EVENTS[action]);
+      // The transaction is confirmed on chain; wait for the indexer to
+      // catch up instead of refetching a stale row immediately (#9).
+      setBusy(null);
+      setStaleTx(null);
+      setReconciling(action);
+      const outcome = await pollVoucherStatus(
+        () => api.voucher(v.id).then((detail) => detail.status),
+        EXPECTED_STATUS[action],
+      );
+      if (!mounted.current) return;
+      setReconciling(null);
       void invalidateVouchers(v.id);
       onDone?.();
-      toast.success(
-        <>
-          Done.{' '}
-          <ExplorerLink href={explorerTx(res.hash)}>View transaction</ExplorerLink>
-        </>,
-      );
+      if (outcome === 'matched') {
+        toast.success(
+          <>
+            Done.{' '}
+            <ExplorerLink href={explorerTx(res.hash)}>View transaction</ExplorerLink>
+          </>,
+        );
+      } else {
+        setStaleTx(res.hash);
+        toast.success(
+          <>
+            Confirmed on chain — the indexer is still catching up.{' '}
+            <ExplorerLink href={explorerTx(res.hash)}>View transaction</ExplorerLink>
+          </>,
+        );
+      }
     } catch (err) {
       toast.error(humaniseError(err));
     } finally {
-      setBusy(null);
+      if (mounted.current) setBusy(null);
     }
   }
 
-  // Only offer an action the contract will actually accept right now.
-  const available = actions.filter((a) => {
-    switch (a) {
-      case 'claim':
-        return v.status === 'Funded';
-      case 'attest':
-        return v.status === 'Claimed';
-      case 'settle':
-        return v.isSettleable;
-      case 'refund':
-        return v.isRefundable;
-      case 'dispute':
-        return v.status === 'Claimed' || v.status === 'Attested';
-      default:
+  // Only offer an action the contract will actually accept right now
+  // (state machine in `@/lib/voucher-actions`, covered by unit tests).
+  const available = availableActions(
+    v.status,
+    { isSettleable: v.isSettleable, isRefundable: v.isRefundable },
+    actions,
+  );
+
+  useImperativeHandle(ref, () => ({
+    startAttest: () => {
+      if (
+        disabled ||
+        !available.includes('attest') ||
+        busy !== null ||
+        reconciling !== null
+      ) {
         return false;
-    }
+      }
+      setAttesting(true);
+      return true;
+    },
+  }));
+
+  const fundAgainParams = new URLSearchParams({
+    service: String(v.serviceCode),
+    amount: toAmountInput(v.amount),
   });
+  const fundAgainHref = `/clinics/${encodeURIComponent(v.provider.address)}?${fundAgainParams}`;
 
   return (
     // Without the summary, the first hint or button row sits at the top.
@@ -105,12 +200,12 @@ export function VoucherRow({
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <div className="flex items-center gap-2">
-              <Link
-                href={`/vouchers/${v.id}`}
+              <DetailLink
+                detail={{ kind: 'voucher', id: v.id }}
                 className="mono text-xs text-[var(--color-ink-soft)] underline-offset-2 hover:underline"
               >
                 #{v.id}
-              </Link>
+              </DetailLink>
               <StatusBadge status={v.status} />
             </div>
             <h3 className="mt-1 font-medium">
@@ -120,7 +215,7 @@ export function VoucherRow({
               {v.serviceLabel ?? `Service ${v.serviceCode}`} · funded {formatDate(v.createdAt)}
             </p>
           </div>
-          <div className="text-right">
+          <div className="text-end">
             <div className="mono text-lg font-semibold">${formatUsdc(v.amount)}</div>
             {v.status === 'Settled' && v.settledNet && (
               <div className="text-xs text-[var(--color-ink-soft)]">
@@ -131,11 +226,18 @@ export function VoucherRow({
         </div>
       )}
 
+      <Link
+        href={fundAgainHref}
+        className="mt-3 inline-flex items-center rounded-md border border-[var(--color-line)] px-3 py-1.5 text-sm font-medium text-[var(--color-brand)] transition hover:bg-[var(--color-canvas)]"
+      >
+        Fund again
+      </Link>
+
       {v.status === 'Attested' && v.disputeDeadline && !v.isSettleable && (
         <p className="mt-3 text-xs text-[var(--color-ink-soft)]">
-          Dispute window closes in {timeUntil(v.disputeDeadline, now)} — settles after
-          that.
-          <InfoTip content="Anyone can dispute before the window closes. After it closes, anyone can release the payment to the clinic." />
+          Dispute window closes {timeUntil(v.disputeDeadline, now, locale)} — settles
+          after that.
+          <InfoTip content="The funder can dispute before the window closes. After it closes, anyone can release the payment to the clinic." />
         </p>
       )}
       {v.status === 'Funded' && (
@@ -145,11 +247,20 @@ export function VoucherRow({
         </p>
       )}
       {v.status === 'Claimed' && v.refundableAt && !v.isRefundable && (
-        <p className="mt-3 text-xs text-[var(--color-ink-soft)]">
-          Waiting for an attester to confirm. If nobody does, this becomes
-          refundable on {formatDate(v.refundableAt)}.
-          <InfoTip content="An independent attester must confirm care was delivered. Without confirmation the funder can reclaim after this date." />
-        </p>
+        <>
+          {v.claimedAt && (
+            <p className="mt-3 text-xs text-[var(--color-ink-soft)]">
+              Claimed {timeSince(v.claimedAt, now, locale)}.
+            </p>
+          )}
+          <p className="mt-1 text-xs">
+            Refundable <span className={isUrgent(v.refundableAt, now) ? 'font-semibold text-[var(--color-danger)]' : ''}>
+              {timeUntil(v.refundableAt, now, locale)}
+            </span>
+            ({formatDate(v.refundableAt)}).
+            <InfoTip content="An independent attester must confirm care was delivered. Without confirmation the funder can reclaim after this date." />
+          </p>
+        </>
       )}
       {v.status === 'Disputed' && v.disputeReason != null && (
         <p className="mt-3 text-xs text-[var(--color-ink-soft)]">
@@ -170,17 +281,77 @@ export function VoucherRow({
             <Button
               key={a}
               variant={a === 'dispute' ? 'danger' : a === 'settle' ? 'primary' : 'ghost'}
-              disabled={busy !== null}
+              disabled={
+                disabled ||
+                busy !== null ||
+                reconciling !== null ||
+                (a === 'claim' && requirePatientMatch && !patientVerified)
+              }
               onClick={() => {
                 if (a === 'dispute') setDisputing(true);
                 else if (a === 'attest') setAttesting(true);
                 else void run(a);
               }}
             >
-              {busy === a ? 'Confirming…' : LABELS[a]}
+              {busy === a ? 'Confirming…' : reconciling === a ? 'Updating…' : LABELS[a]}
             </Button>
           ))}
         </div>
+      )}
+
+      {available.includes('claim') && (
+        <div className="mt-4 rounded-lg border border-[var(--color-line)] bg-[var(--color-canvas)] p-4">
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h4 className="flex items-center gap-2 text-sm font-medium">
+                Verify patient
+                {patientVerified && (
+                  <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 ring-1 ring-inset ring-emerald-200">
+                    Match
+                  </span>
+                )}
+              </h4>
+              <p className="mt-1 text-xs text-[var(--color-ink-soft)]">
+                {requirePatientMatch
+                  ? 'Have the patient, or whoever holds their key, confirm this voucher on this device before claiming.'
+                  : 'Optional: have the patient, or whoever holds their key, confirm this voucher on this device.'}
+              </p>
+            </div>
+            <Button variant="ghost" onClick={() => setVerifying((open) => !open)}>
+              {verifying ? 'Hide check' : patientVerified ? 'Verify again' : 'Verify patient'}
+            </Button>
+          </div>
+
+          {!verifying && requirePatientMatch && !patientVerified && (
+            <p role="status" className="mt-3 text-xs text-[var(--color-ink-soft)]">
+              This desk requires a patient check before claiming. The reference and key
+              enable “Mark patient seen”.
+            </p>
+          )}
+
+          {verifying && (
+            <div className="mt-3">
+              <VerifyPatient
+                expectedRef={v.beneficiaryRef}
+                onVerifiedChange={(verified) =>
+                  setVerifiedFor(verified ? verificationKey : null)
+                }
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {reconciling && (
+        <p role="status" className="mt-3 text-xs text-[var(--color-ink-soft)]">
+          Confirmed on chain, updating…
+        </p>
+      )}
+      {staleTx && !reconciling && (
+        <p className="mt-3 text-xs text-[var(--color-ink-soft)]">
+          The transaction succeeded on chain but the list has not caught up yet.{' '}
+          <ExplorerLink href={explorerTx(staleTx)}>View transaction</ExplorerLink>
+        </p>
       )}
 
       <Modal
@@ -193,7 +364,7 @@ export function VoucherRow({
           <>
             <Button
               variant="danger"
-              disabled={busy !== null}
+              disabled={disabled || busy !== null}
               onClick={() => void run('dispute')}
             >
               {busy === 'dispute' ? 'Confirming…' : 'Open dispute'}
@@ -242,7 +413,7 @@ export function VoucherRow({
         actions={
           <>
             <Button
-              disabled={busy !== null}
+              disabled={disabled || busy !== null}
               onClick={() => void run('attest')}
             >
               {busy === 'attest' ? 'Confirming…' : 'Confirm'}

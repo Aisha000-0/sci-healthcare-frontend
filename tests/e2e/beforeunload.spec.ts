@@ -39,6 +39,11 @@ test('warns before unload only while a transaction is pending', async ({ page })
   await page.getByPlaceholder('e.g. clinic card number').fill('CARD-123');
   await page.getByPlaceholder('stays on this device').fill('s'.repeat(32));
   await page.getByRole('button', { name: 'Fund voucher' }).click();
+  // Funding now goes through a review step (#22).
+  await page.getByRole('button', { name: 'Confirm', exact: true }).click();
+  // Wait for the review step to close and the write to actually be in flight
+  // before probing the guard, so the pending state is observable.
+  await expect(page.getByRole('button', { name: 'Confirm', exact: true })).toBeHidden();
 
   // While the write is in flight, the unload is cancelled (browser warns).
   await expect

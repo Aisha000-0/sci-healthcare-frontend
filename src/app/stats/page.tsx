@@ -3,8 +3,26 @@
 import { useMemo, useState } from 'react';
 
 import { formatUsdc } from '@/lib/amounts';
-import { useDailyStats, useProviders, useStats } from '@/lib/hooks';
-import { Card, Empty } from '@/components/ui';
+import { compareEscrow } from '@/lib/escrow';
+import {
+  buildClinicCountryCsvRows,
+  buildCountryVoucherCsvRows,
+  buildDailyStatsCsvRows,
+  downloadCsv,
+} from '@/lib/csv';
+import {
+  useDailyStats,
+  useEscrowSummary,
+  useOpenEscrowTotal,
+  useProviders,
+  useStats,
+  useVouchers,
+} from '@/lib/hooks';
+import { useLocaleContext } from '@/i18n/LocaleContext';
+import { Alert, Button, Card, Empty } from '@/components/ui';
+import { DataTable } from '@/components/DataTable';
+import { SkeletonCard } from '@/components/Skeleton';
+import { WidgetBoundary } from '@/components/WidgetBoundary';
 
 type TimeRange = 7 | 14 | 30 | 90;
 
@@ -126,12 +144,21 @@ function ActivityChart({
 }
 
 export default function StatsPage() {
+  const { t, locale } = useLocaleContext();
   const [days, setDays] = useState<TimeRange>(30);
   const [showTables, setShowTables] = useState<boolean>(false);
 
   const { stats } = useStats();
   const { dailyStats, isLoading: dailyLoading } = useDailyStats(days);
   const { providers } = useProviders();
+  const { vouchers } = useVouchers({});
+  // The contract's own escrow accounting, read by simulation without a
+  // wallet, beside the indexer's total for the same money (#295).
+  const { escrow, error: escrowError, isLoading: escrowLoading } = useEscrowSummary();
+  const { indexedOpen, error: indexedError } = useOpenEscrowTotal();
+  const escrowComparison = escrow
+    ? compareEscrow(escrow[0], escrow[1], indexedOpen)
+    : null;
 
   // Aggregate country statistics
   const countryCounts = useMemo(() => {
@@ -144,6 +171,31 @@ export default function StatsPage() {
     }
     return Array.from(map.entries()).sort((a, b) => b[1].count - a[1].count);
   }, [providers]);
+
+  // Voucher activity per country: funded and settled counts plus settled value.
+  const countryVouchers = useMemo(() => {
+    const map = new Map<
+      string,
+      { funded: number; fundedValue: bigint; settled: number; settledValue: bigint }
+    >();
+    for (const v of vouchers) {
+      const country = String(v.provider?.country ?? '');
+      const entry =
+        map.get(country) ?? { funded: 0, fundedValue: 0n, settled: 0, settledValue: 0n };
+      if (v.status === 'Funded') {
+        entry.funded += 1;
+        entry.fundedValue += BigInt(v.amount || '0');
+      }
+      if (v.status === 'Settled') {
+        entry.settled += 1;
+        entry.settledValue += BigInt(v.amount || '0');
+      }
+      map.set(country, entry);
+    }
+    return Array.from(map.entries()).sort(
+      (a, b) => Number(b[1].settledValue - a[1].settledValue) || b[1].settled - a[1].settled,
+    );
+  }, [vouchers]);
 
   const series = useMemo(() => dailyStats?.series ?? [], [dailyStats]);
 
@@ -170,6 +222,37 @@ export default function StatsPage() {
   const totalSettledVolume = useMemo(() => {
     return series.reduce((acc, s) => acc + BigInt(s.settled.amount || '0'), 0n).toString();
   }, [series]);
+
+  function downloadDailyActivityCsv() {
+    downloadCsv(`daily-activity-${days}d.csv`, buildDailyStatsCsvRows(series));
+  }
+
+  function downloadClinicsByCountryCsv() {
+    downloadCsv(
+      'clinics-by-country.csv',
+      buildClinicCountryCsvRows(
+        countryCounts.map(([country, count]) => ({
+          country,
+          registered: count.count,
+          active: count.active,
+        })),
+      ),
+    );
+  }
+
+  function downloadCountryVouchersCsv() {
+    downloadCsv(
+      'voucher-activity-by-country.csv',
+      buildCountryVoucherCsvRows(
+        countryVouchers.map(([country, activity]) => ({
+          country,
+          funded: activity.funded,
+          settled: activity.settled,
+          settledValue: activity.settledValue,
+        })),
+      ),
+    );
+  }
 
   return (
     <div className="space-y-8">
@@ -246,20 +329,101 @@ export default function StatsPage() {
         </Card>
       </section>
 
+      {/* On-chain escrow (#295) */}
+      <section aria-label={t('stats.escrowTitle')}>
+        <Card className="space-y-3 p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="text-base font-semibold">{t('stats.escrowTitle')}</h2>
+              <p className="mt-0.5 text-xs text-[var(--color-ink-soft)]">
+                {t('stats.escrowNote')}
+              </p>
+            </div>
+            <div className="text-end">
+              <div className="text-xs uppercase tracking-wide text-[var(--color-ink-soft)]">
+                {t('stats.escrowOpen')}
+              </div>
+              <div className="mt-1 text-2xl font-bold">
+                {escrowLoading
+                  ? '…'
+                  : escrow
+                    ? `$${formatUsdc(escrow[0], locale)}`
+                    : '—'}
+              </div>
+              {escrow && (
+                <div className="mt-0.5 text-xs text-[var(--color-ink-soft)]">
+                  {t('stats.escrowBalance', {
+                    amount: `$${formatUsdc(escrow[1], locale)}`,
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {indexedOpen !== null && (
+            <p className="text-xs text-[var(--color-ink-soft)]">
+              {t('stats.escrowIndexed', {
+                amount: `$${formatUsdc(indexedOpen, locale)}`,
+              })}
+            </p>
+          )}
+
+          {escrowError && (
+            <p className="text-xs text-[var(--color-ink-soft)]">
+              {t('stats.escrowUnavailable')}
+            </p>
+          )}
+          {indexedError && (
+            <p className="text-xs text-[var(--color-ink-soft)]">
+              {t('stats.escrowIndexedUnavailable')}
+            </p>
+          )}
+
+          {escrowComparison?.solvencyDiffers && (
+            <Alert>
+              {t('stats.escrowSolvencyMismatch', {
+                escrow: `$${formatUsdc(escrowComparison.openEscrow, locale)}`,
+                balance: `$${formatUsdc(escrowComparison.tokenBalance, locale)}`,
+              })}
+            </Alert>
+          )}
+          {escrowComparison?.indexerDiffers && (
+            <Alert kind="info">
+              {t('stats.escrowIndexerMismatch', {
+                chain: `$${formatUsdc(escrowComparison.openEscrow, locale)}`,
+                indexed: `$${formatUsdc(escrowComparison.indexedOpen ?? 0n, locale)}`,
+              })}
+            </Alert>
+          )}
+        </Card>
+      </section>
+
       {/* View Mode Toggle for Accessibility */}
       <div className="flex items-center justify-between border-b border-[var(--color-line)] pb-3">
         <h2 className="text-base font-semibold">Daily activity ({days} days)</h2>
-        <button
-          type="button"
-          onClick={() => setShowTables(!showTables)}
-          className="text-xs font-medium text-[var(--color-brand)] underline hover:opacity-80"
-        >
-          {showTables ? 'Hide data tables' : 'Show accessible data tables'}
-        </button>
+        <div className="flex items-center gap-3">
+          <Button
+            variant="ghost"
+            onClick={downloadDailyActivityCsv}
+            disabled={series.length === 0}
+          >
+            {t('stats.downloadDaily')}
+          </Button>
+          <button
+            type="button"
+            onClick={() => setShowTables(!showTables)}
+            className="text-xs font-medium text-[var(--color-brand)] underline hover:opacity-80"
+          >
+            {showTables ? 'Hide data tables' : 'Show accessible data tables'}
+          </button>
+        </div>
       </div>
 
       {dailyLoading && (
-        <p className="text-sm text-[var(--color-ink-soft)]">Loading activity time series…</p>
+        <div className="grid gap-6 lg:grid-cols-2">
+          <SkeletonCard lines={4} />
+          <SkeletonCard lines={4} />
+        </div>
       )}
 
       {/* Daily Charts */}
@@ -274,34 +438,45 @@ export default function StatsPage() {
               Total {days}d volume: ${formatUsdc(totalFundedVolume)}
             </p>
             <div className="mt-4">
-              <ActivityChart
-                title="Daily Vouchers Funded"
-                data={fundedSeries}
-                color="var(--color-brand)"
-              />
+              {/* One broken chart leaves the totals, tables and the other chart up (#169). */}
+              <WidgetBoundary label="This chart">
+                <ActivityChart
+                  title="Daily Vouchers Funded"
+                  data={fundedSeries}
+                  color="var(--color-brand)"
+                />
+              </WidgetBoundary>
             </div>
             {showTables && (
               <div className="mt-6 border-t border-[var(--color-line)] pt-4">
                 <div className="max-h-60 overflow-y-auto">
-                  <table className="w-full text-left text-xs">
-                    <caption className="sr-only">Daily vouchers funded data table</caption>
-                    <thead>
-                      <tr className="border-b border-[var(--color-line)] text-[var(--color-ink-soft)]">
-                        <th scope="col" className="py-1.5 font-medium">Date (UTC)</th>
-                        <th scope="col" className="py-1.5 text-right font-medium">Count</th>
-                        <th scope="col" className="py-1.5 text-right font-medium">Volume (USDC)</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-[var(--color-line)]">
-                      {series.map((s) => (
-                        <tr key={s.date}>
-                          <td className="py-1.5 font-mono">{s.date}</td>
-                          <td className="py-1.5 text-right">{s.funded.count}</td>
-                          <td className="py-1.5 text-right font-mono">${formatUsdc(s.funded.amount)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                  <DataTable
+                    caption="Daily vouchers funded data table"
+                    rows={series}
+                    getRowKey={(row) => row.date}
+                    columns={[
+                      {
+                        key: 'date',
+                        header: 'Date (UTC)',
+                        accessor: (row) => row.date,
+                        className: 'font-mono',
+                      },
+                      {
+                        key: 'count',
+                        header: 'Count',
+                        accessor: (row) => row.funded.count,
+                        align: 'right',
+                      },
+                      {
+                        key: 'amount',
+                        header: 'Volume (USDC)',
+                        accessor: (row) => row.funded.amount,
+                        align: 'right',
+                        className: 'font-mono',
+                        render: (row) => `$${formatUsdc(row.funded.amount)}`,
+                      },
+                    ]}
+                  />
                 </div>
               </div>
             )}
@@ -314,34 +489,44 @@ export default function StatsPage() {
               Total {days}d volume: ${formatUsdc(totalSettledVolume)}
             </p>
             <div className="mt-4">
-              <ActivityChart
-                title="Daily Care Settled"
-                data={settledSeries}
-                color="#059669"
-              />
+              <WidgetBoundary label="This chart">
+                <ActivityChart
+                  title="Daily Care Settled"
+                  data={settledSeries}
+                  color="#059669"
+                />
+              </WidgetBoundary>
             </div>
             {showTables && (
               <div className="mt-6 border-t border-[var(--color-line)] pt-4">
                 <div className="max-h-60 overflow-y-auto">
-                  <table className="w-full text-left text-xs">
-                    <caption className="sr-only">Daily care settled data table</caption>
-                    <thead>
-                      <tr className="border-b border-[var(--color-line)] text-[var(--color-ink-soft)]">
-                        <th scope="col" className="py-1.5 font-medium">Date (UTC)</th>
-                        <th scope="col" className="py-1.5 text-right font-medium">Count</th>
-                        <th scope="col" className="py-1.5 text-right font-medium">Volume (USDC)</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-[var(--color-line)]">
-                      {series.map((s) => (
-                        <tr key={s.date}>
-                          <td className="py-1.5 font-mono">{s.date}</td>
-                          <td className="py-1.5 text-right">{s.settled.count}</td>
-                          <td className="py-1.5 text-right font-mono">${formatUsdc(s.settled.amount)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                  <DataTable
+                    caption="Daily care settled data table"
+                    rows={series}
+                    getRowKey={(row) => row.date}
+                    columns={[
+                      {
+                        key: 'date',
+                        header: 'Date (UTC)',
+                        accessor: (row) => row.date,
+                        className: 'font-mono',
+                      },
+                      {
+                        key: 'count',
+                        header: 'Count',
+                        accessor: (row) => row.settled.count,
+                        align: 'right',
+                      },
+                      {
+                        key: 'amount',
+                        header: 'Volume (USDC)',
+                        accessor: (row) => row.settled.amount,
+                        align: 'right',
+                        className: 'font-mono',
+                        render: (row) => `$${formatUsdc(row.settled.amount)}`,
+                      },
+                    ]}
+                  />
                 </div>
               </div>
             )}
@@ -351,30 +536,110 @@ export default function StatsPage() {
 
       {/* Country Breakdown Table */}
       <section className="space-y-3">
-        <h2 className="text-base font-semibold">Clinics by country</h2>
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="text-base font-semibold">Clinics by country</h2>
+          <Button
+            variant="ghost"
+            onClick={downloadClinicsByCountryCsv}
+            disabled={countryCounts.length === 0}
+          >
+            {t('stats.downloadClinics')}
+          </Button>
+        </div>
         <Card className="overflow-x-auto p-4">
-          <table className="w-full text-left text-sm">
+          <table className="block w-full text-start text-sm sm:table">
             <caption className="sr-only">Registered clinics grouped by country</caption>
-            <thead>
+            <thead className="hidden sm:table-header-group">
               <tr className="border-b border-[var(--color-line)] text-xs text-[var(--color-ink-soft)]">
                 <th scope="col" className="pb-2 font-medium">Country code</th>
                 <th scope="col" className="pb-2 font-medium">Total registered</th>
                 <th scope="col" className="pb-2 font-medium">Active status</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-[var(--color-line)]">
+            <tbody className="block divide-y divide-[var(--color-line)] sm:table-row-group">
               {countryCounts.length === 0 ? (
-                <tr>
-                  <td colSpan={3} className="py-4 text-center text-xs text-[var(--color-ink-soft)]">
+                <tr className="block sm:table-row">
+                  <td
+                    colSpan={3}
+                    className="block py-4 text-center text-xs text-[var(--color-ink-soft)] sm:table-cell"
+                  >
                     No clinics recorded yet.
                   </td>
                 </tr>
               ) : (
                 countryCounts.map(([country, stats]) => (
-                  <tr key={country}>
-                    <td className="py-2.5 font-medium">{country}</td>
-                    <td className="py-2.5">{stats.count}</td>
-                    <td className="py-2.5 text-emerald-700">{stats.active} active</td>
+                  <tr
+                    key={country}
+                    className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-3 sm:table-row sm:py-0"
+                  >
+                    <td className="block font-medium sm:table-cell sm:py-2.5">{country}</td>
+                    <td className="block text-xs text-[var(--color-ink-soft)] sm:table-cell sm:py-2.5 sm:text-sm sm:text-[var(--color-ink)]">
+                      {stats.count} registered
+                    </td>
+                    <td className="block text-xs text-emerald-700 sm:table-cell sm:py-2.5 sm:text-sm">
+                      {stats.active} active
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </Card>
+      </section>
+
+      {/* Vouchers by country */}
+      <section className="space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="text-base font-semibold">Voucher activity by country</h2>
+          <Button
+            variant="ghost"
+            onClick={downloadCountryVouchersCsv}
+            disabled={countryVouchers.length === 0}
+          >
+            {t('stats.downloadVouchers')}
+          </Button>
+        </div>
+        <Card className="overflow-x-auto p-4">
+          <table className="block w-full text-left text-sm sm:table">
+            <caption className="sr-only">
+              Vouchers funded, settled and value grouped by clinic country
+            </caption>
+            <thead className="hidden sm:table-header-group">
+              <tr className="border-b border-[var(--color-line)] text-xs text-[var(--color-ink-soft)]">
+                <th scope="col" className="pb-2 font-medium">Country code</th>
+                <th scope="col" className="pb-2 font-medium text-right">Vouchers funded</th>
+                <th scope="col" className="pb-2 font-medium text-right">Care settled</th>
+                <th scope="col" className="pb-2 font-medium text-right">Value settled</th>
+              </tr>
+            </thead>
+            <tbody className="block divide-y divide-[var(--color-line)] sm:table-row-group">
+              {countryVouchers.length === 0 ? (
+                <tr className="block sm:table-row">
+                  <td
+                    colSpan={4}
+                    className="block py-4 text-center text-xs text-[var(--color-ink-soft)] sm:table-cell"
+                  >
+                    No voucher activity recorded yet.
+                  </td>
+                </tr>
+              ) : (
+                countryVouchers.map(([country, activity]) => (
+                  <tr
+                    key={country}
+                    className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-3 sm:table-row sm:py-0"
+                  >
+                    <td className="block font-medium sm:table-cell sm:py-2.5">
+                      {country}
+                    </td>
+                    <td className="block text-xs text-[var(--color-ink-soft)] sm:table-cell sm:py-2.5 sm:text-sm sm:text-[var(--color-ink)] text-right">
+                      {activity.funded} funded
+                    </td>
+                    <td className="block text-xs text-emerald-700 sm:table-cell sm:py-2.5 sm:text-sm text-right">
+                      {activity.settled} settled
+                    </td>
+                    <td className="block text-xs text-[var(--color-ink)] sm:table-cell sm:py-2.5 sm:text-sm text-right font-mono">
+                      ${formatUsdc(activity.settledValue.toString())}
+                    </td>
                   </tr>
                 ))
               )}

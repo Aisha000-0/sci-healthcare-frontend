@@ -7,13 +7,20 @@ import {
   type Attester,
   type DailyStats,
   type Provider,
-  type Receipt,
+  type ProviderStats,
+  type ReadyStatus,
+  type ReceiptsResponse,
+  type ServiceCatalogueItem,
+  type ServicesResponse,
   type Stats,
+  type VersionInfo,
   type Voucher,
+  type VoucherDetail,
   type VoucherEvent,
+  type VouchersResponse,
 } from '../api';
 
-export type LoadedVoucher = Voucher & { receipt: Receipt | null };
+export type LoadedVoucher = VoucherDetail;
 
 /**
  * Hook for fetching and caching a single voucher with its receipt (#63).
@@ -74,8 +81,9 @@ export function useVouchers(
     status?: string;
     /** Page size; pass 1 when only `total` is used. */
     limit?: number;
+    offset?: number;
   } | null,
-  config?: SWRConfiguration<{ total: number; vouchers: Voucher[] }>,
+  config?: SWRConfiguration<VouchersResponse>,
 ) {
   const { data, error, isLoading, isValidating, mutate } = useSWR(
     params ? ['vouchers', params] : null,
@@ -118,15 +126,113 @@ export function useProvider(
 }
 
 /**
+ * Hook for one clinic's aggregate statistics (backend #10).
+ *
+ * Powers the earnings cards on the clinic desk. The indexer answers 404 for
+ * an address it has never seen registered, which the desk reads as "no
+ * earnings yet" rather than an error, so this does not retry on error.
+ */
+export function useProviderStats(
+  address: string | null | undefined,
+  config?: SWRConfiguration<ProviderStats>,
+) {
+  const { data, error, isLoading, isValidating, mutate } = useSWR<ProviderStats>(
+    address ? ['provider-stats', address] : null,
+    () => api.providerStats(address!),
+    { shouldRetryOnError: false, ...config },
+  );
+
+  return {
+    stats: data ?? null,
+    error: error instanceof Error ? error.message : error ? String(error) : null,
+    rawError: error,
+    isLoading,
+    isValidating,
+    mutate,
+  };
+}
+
+/**
+ * The voucher contract's own escrow accounting (#295). A simulation read,
+ * so it needs no wallet. The SDK is imported lazily to keep it out of the
+ * statistics page's initial bundle.
+ */
+export function useEscrowSummary() {
+  const { data, error, isLoading, mutate } = useSWR<[bigint, bigint]>(
+    'escrow-summary',
+    async () => {
+      const { voucher } = await import('../protocol');
+      return voucher.escrowSummary();
+    },
+    { shouldRetryOnError: false },
+  );
+
+  return {
+    escrow: data ?? null,
+    error: error instanceof Error ? error.message : error ? String(error) : null,
+    isLoading,
+    mutate,
+  };
+}
+
+/**
+ * Total open escrow the indexer reports (#295), across every open status.
+ */
+export function useOpenEscrowTotal() {
+  const { data, error, isLoading, mutate } = useSWR<bigint>(
+    'open-escrow-total',
+    () => api.openEscrowTotal(),
+    { shouldRetryOnError: false },
+  );
+
+  return {
+    indexedOpen: data ?? null,
+    error: error instanceof Error ? error.message : error ? String(error) : null,
+    isLoading,
+    mutate,
+  };
+}
+
+/**
+ * Hook for every voucher a clinic has received, across list-route pages.
+ *
+ * The monthly earnings table is an aggregate over the whole history, so it
+ * cannot be built from the first page the incoming-voucher list shows.
+ */
+export function useProviderVouchers(
+  address: string | null | undefined,
+  config?: SWRConfiguration<Voucher[]>,
+) {
+  const { data, error, isLoading, isValidating, mutate } = useSWR<Voucher[]>(
+    address ? ['provider-vouchers', address] : null,
+    () => api.providerVouchers(address!),
+    config,
+  );
+
+  return {
+    vouchers: data ?? [],
+    error: error instanceof Error ? error.message : error ? String(error) : null,
+    rawError: error,
+    isLoading,
+    isValidating,
+    mutate,
+  };
+}
+
+/**
  * Hook for fetching and caching provider directory (#63).
+ *
+ * `null` skips the request, like `useVouchers`: a caller that only needs the
+ * directory once something is open (the command palette) must not make every
+ * page in the app fetch it.
  */
 export function useProviders(
-  params?: { status?: string; country?: string; q?: string },
+  params?: { status?: 'Pending' | 'Active' | 'Suspended'; country?: string; q?: string } | null,
   config?: SWRConfiguration<{ total: number; providers: Provider[] }>,
 ) {
   const { data, error, isLoading, isValidating, mutate } = useSWR(
-    ['providers', params ?? {}],
-    () => api.providers(params),
+    params === null ? null : ['providers', params ?? {}],
+    () => api.providers(params ?? undefined),
     config,
   );
 
@@ -153,6 +259,47 @@ export function useStats(config?: SWRConfiguration<Stats>) {
 
   return {
     stats: data ?? null,
+    error: error instanceof Error ? error.message : error ? String(error) : null,
+    rawError: error,
+    isLoading,
+    isValidating,
+    mutate,
+  };
+}
+
+/**
+ * Hook for the indexer's readiness check (#168). A degraded answer is data,
+ * not an error; `error` is set only when the API cannot be reached at all.
+ */
+export function useReady(config?: SWRConfiguration<ReadyStatus>) {
+  const { data, error, isLoading, isValidating, mutate } = useSWR<ReadyStatus>(
+    'ready',
+    () => api.ready(),
+    config,
+  );
+
+  return {
+    ready: data ?? null,
+    error: error instanceof Error ? error.message : error ? String(error) : null,
+    rawError: error,
+    isLoading,
+    isValidating,
+    mutate,
+  };
+}
+
+/**
+ * Hook for the indexer's build and deployment info (#168).
+ */
+export function useVersion(config?: SWRConfiguration<VersionInfo>) {
+  const { data, error, isLoading, isValidating, mutate } = useSWR<VersionInfo>(
+    'version',
+    () => api.version(),
+    config,
+  );
+
+  return {
+    version: data ?? null,
     error: error instanceof Error ? error.message : error ? String(error) : null,
     rawError: error,
     isLoading,
@@ -205,13 +352,57 @@ export function useAttesters(
   };
 }
 
+/**
+ * Hook for fetching and caching the service catalogue (GET /services).
+ */
+export function useServices(config?: SWRConfiguration<ServicesResponse>) {
+  const { data, error, isLoading, isValidating, mutate } = useSWR<ServicesResponse>(
+    'services',
+    () => api.services(),
+    config,
+  );
+
+  return {
+    services: data?.services ?? [],
+    total: data?.total ?? 0,
+    error: error instanceof Error ? error.message : error ? String(error) : null,
+    rawError: error,
+    isLoading,
+    isValidating,
+    mutate,
+  };
+}
+
+/**
+ * Hook for fetching and caching a single service's clinic price comparison (GET /services/:code).
+ */
+export function useService(
+  code: number | null | undefined,
+  config?: SWRConfiguration<ServiceCatalogueItem>,
+) {
+  const { data, error, isLoading, isValidating, mutate } = useSWR<ServiceCatalogueItem>(
+    code ? ['service', code] : null,
+    () => api.service(code!),
+    config,
+  );
+
+  return {
+    service: data ?? null,
+    error: error instanceof Error ? error.message : error ? String(error) : null,
+    rawError: error,
+    isLoading,
+    isValidating,
+    mutate,
+  };
+}
+
 
 /**
  * Hook for fetching and caching receipts for a patient beneficiary ref (#63).
  */
 export function useReceipts(
   beneficiaryRef: string | null | undefined,
-  config?: SWRConfiguration<{ total: number; totalSpendDisplay: string; receipts: Receipt[] }>,
+  config?: SWRConfiguration<ReceiptsResponse>,
 ) {
   const { data, error, isLoading, isValidating, mutate } = useSWR(
     beneficiaryRef ? ['receipts', beneficiaryRef] : null,
@@ -250,6 +441,55 @@ export function useIsAttester(address: string | null | undefined) {
   };
 }
 
+/**
+ * Attestations the connected attester may still make today (#292).
+ *
+ * Read from the voucher contract rather than counted in the browser: the
+ * cap is per attester per UTC day, and only the contract knows how many
+ * this address has already used.
+ */
+export function useAttestationsLeft(attester: string | null | undefined) {
+  const { data, error, isLoading, mutate } = useSWR<number>(
+    attester ? ['attestations-left', attester] : null,
+    async () => {
+      const { voucher } = await import('../protocol');
+      return voucher.attestationsLeft(attester!);
+    },
+    { shouldRetryOnError: false },
+  );
+
+  return {
+    left: data ?? null,
+    error: error instanceof Error ? error.message : error ? String(error) : null,
+    isLoading,
+    mutate,
+  };
+}
+
+/** Admin access requires the same wallet to administer both core contracts. */
+export function useAdminAccess(address: string | null | undefined) {
+  const { data, error, isLoading } = useSWR(
+    address ? ['adminAccess', address] : null,
+    async () => {
+      const { registry, voucher } = await import('../protocol');
+      const [registryAdmin, voucherAdmin] = await Promise.all([
+        registry.admin(),
+        voucher.admin(),
+      ]);
+      return { registryAdmin, voucherAdmin };
+    },
+  );
+
+  return {
+    isAdmin:
+      !!address &&
+      data?.registryAdmin === address &&
+      data?.voucherAdmin === address,
+    isLoading,
+    error: error instanceof Error ? error.message : error ? String(error) : null,
+  };
+}
+
 /** Invalidate all voucher-related cache entries after a transaction */
 export async function invalidateVouchers(voucherId?: string): Promise<void> {
   if (voucherId) {
@@ -259,7 +499,11 @@ export async function invalidateVouchers(voucherId?: string): Promise<void> {
   await globalMutate(
     (key) =>
       Array.isArray(key) &&
-      (key[0] === 'vouchers' || key[0] === 'receipts' || key[0] === 'voucher' || key[0] === 'voucher-events'),
+      (key[0] === 'vouchers' ||
+        key[0] === 'receipts' ||
+        key[0] === 'voucher' ||
+        key[0] === 'voucher-events' ||
+        key[0] === 'wallet-events'),
   );
 }
 
@@ -270,6 +514,10 @@ export async function invalidateProvider(providerAddress?: string): Promise<void
   }
   await globalMutate(
     (key) =>
-      Array.isArray(key) && (key[0] === 'providers' || key[0] === 'provider'),
+      Array.isArray(key) &&
+      (key[0] === 'providers' ||
+        key[0] === 'provider' ||
+        key[0] === 'provider-stats' ||
+        key[0] === 'provider-vouchers'),
   );
 }

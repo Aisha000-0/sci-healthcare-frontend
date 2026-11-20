@@ -1,19 +1,25 @@
 import type { Metadata, Viewport } from 'next';
+import { cookies, headers } from 'next/headers';
 import Link from 'next/link';
 
-import { ConnectButton } from '@/components/ConnectButton';
 import { Analytics } from '@/components/Analytics';
+import { AnalyticsToggle } from '@/components/AnalyticsToggle';
+import { CommandPalette } from '@/components/CommandPalette';
 import { ErrorReporter } from '@/components/ErrorReporter';
-import { LowBandwidthToggle } from '@/components/LowBandwidthToggle';
-import { NetworkBadge } from '@/components/NetworkBadge';
 import { PendingTransactionGuard } from '@/components/PendingTransactionGuard';
 import { ServiceWorkerRegistration } from '@/components/ServiceWorkerRegistration';
 import { SwrProvider } from '@/components/SwrProvider';
 import { TestnetNotice } from '@/components/TestnetNotice';
 import { ToastProvider } from '@/components/Toast';
-import { NavLink } from '@/components/ui';
+import { SiteHeader } from '@/components/SiteHeader';
+import { SkipToContent } from '@/components/SkipToContent';
 import { WalletProvider } from '@/lib/wallet';
 import { config, isTestnet } from '@/lib/config';
+
+import { LocaleProvider } from '@/i18n/LocaleContext';
+import { resolveLocale } from '@/i18n/detect';
+import { directionForLocale } from '@/i18n/direction';
+import { LanguageSwitcher } from '@/components/LanguageSwitcher';
 
 import './globals.css';
 
@@ -28,8 +34,8 @@ export const metadata: Metadata = {
   applicationName: 'SCI Healthcare',
   icons: {
     icon: [
-      { url: '/icons/icon-192.png', sizes: '192x192', type: 'image/png' },
-      { url: '/icons/icon-512.png', sizes: '512x512', type: 'image/png' },
+      { url: '/icons/favicon-32.png', sizes: '32x32', type: 'image/png' },
+      { url: '/icons/icon.svg', sizes: 'any', type: 'image/svg+xml' },
     ],
     apple: [{ url: '/icons/apple-touch-icon.png', sizes: '180x180' }],
   },
@@ -45,62 +51,82 @@ export const viewport: Viewport = {
   themeColor: '#0f766e',
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  // The language is resolved before the first byte (#277): an explicit
+  // choice from NEXT_LOCALE wins, otherwise the browser's Accept-Language.
+  // Passing it to LocaleProvider keeps the server render and hydration in
+  // agreement, so no English flashes before the switch.
+  const [cookieStore, headerList] = await Promise.all([cookies(), headers()]);
+  const initialLocale = resolveLocale(
+    cookieStore.get('NEXT_LOCALE')?.value,
+    headerList.get('accept-language'),
+  );
+
+  // suppressHydrationWarning: the theme init script sets data-theme before
+  // paint, which the server render cannot know (#10).
+  //
+  // Every layout rule below is a logical utility, so the whole tree follows
+  // the `dir` attribute (#131).
   return (
-    <html lang="en">
+    <html
+      lang={initialLocale}
+      dir={directionForLocale(initialLocale)}
+      suppressHydrationWarning
+    >
+      <head>
+        {/* Theme before paint (#10): stored override, else the OS setting.
+            A same-origin script in the server HTML rather than an inline
+            `dangerouslySetInnerHTML` script: React renders inline script
+            content through `innerHTML`, a Trusted Types script sink (#147).
+            Parser-inserted and synchronous, so it still runs before paint. */}
+        {/* eslint-disable-next-line @next/next/no-sync-scripts -- runs before
+            paint on purpose; deferring it would flash the wrong theme */}
+        <script src="/theme-init.js" />
+      </head>
       <body>
         {config.plausibleDomain ? <Analytics domain={config.plausibleDomain} /> : null}
         <ErrorReporter />
         <PendingTransactionGuard />
-        <ServiceWorkerRegistration />
         <WalletProvider>
           {/* Application-wide SWR defaults, relaxed in low-bandwidth mode
               (#75). The setting is read once here so every page below sees
               the same behaviour. */}
           <SwrProvider>
-            <TestnetNotice />
-            <header className="border-b border-[var(--color-line)] bg-[var(--color-surface)]">
-              <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-x-3 gap-y-2 px-4 py-3 sm:px-6">
-                <div className="flex min-w-0 items-center gap-6">
-                  <Link href="/" className="flex items-center gap-2 font-semibold">
-                    <span
-                      aria-hidden
-                      className="grid h-7 w-7 place-items-center rounded-lg bg-[var(--color-brand)] text-sm text-white"
-                    >
-                      ✚
-                    </span>
-                    SCI Healthcare
-                  </Link>
-                  <nav className="hidden items-center gap-1 sm:flex">
-                    <NavLink href="/">Clinics</NavLink>
-                    <NavLink href="/how-it-works">How it works</NavLink>
-                    <NavLink href="/my">My vouchers</NavLink>
-                    <NavLink href="/clinic">Clinic desk</NavLink>
-                    <NavLink href="/attest">Attest</NavLink>
-                    <NavLink href="/faq">FAQ</NavLink>
-                  </nav>
-                </div>
-                <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
-                  <LowBandwidthToggle />
-                  <NetworkBadge />
-                  <ConnectButton />
-                </div>
-              </div>
-            </header>
+            {/* Language for translated text (#5); starts from the locale the
+                server resolved and remembers the visitor's choice. */}
+            <LocaleProvider initialLocale={initialLocale}>
+            <SkipToContent />
+            <div className="print:hidden">
+              <TestnetNotice />
+            </div>
+            <SiteHeader />
+            <CommandPalette />
 
-            <main className="mx-auto max-w-6xl px-6 py-8">
+            <main
+              id="main-content"
+              tabIndex={-1}
+              className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8 print:max-w-none print:px-0 print:py-0"
+            >
               {/* Toasts live here so transaction results from any page appear
                   wherever the user is looking (#80). */}
-              <ToastProvider>{children}</ToastProvider>
+              <ToastProvider>
+                <ServiceWorkerRegistration />
+                {children}
+              </ToastProvider>
             </main>
 
-            <footer className="mx-auto max-w-6xl border-t border-[var(--color-line)] px-6 py-8 text-xs text-[var(--color-ink-soft)]">
+            <footer className="mx-auto max-w-6xl border-t border-[var(--color-line)] px-4 py-8 text-xs text-[var(--color-ink-soft)] sm:px-6 print:hidden">
               <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                 <p className="max-w-xl">
                   {isTestnet
                     ? 'Testnet deployment. No real funds, and no patient health information is stored on chain — vouchers reference a service category and an opaque beneficiary reference only.'
                     : 'No patient health information is stored on chain — vouchers reference a service category and an opaque beneficiary reference only.'}
                 </p>
+                {/* Language choice for translated text (#5). */}
+                <LanguageSwitcher />
+                {/* Explicit analytics opt-out (#143); hidden when analytics
+                    is not configured at build time. */}
+                <AnalyticsToggle />
                 <nav aria-label="Footer navigation" className="flex flex-wrap gap-4 font-medium text-[var(--color-ink)]">
                   <Link href="/how-it-works" className="hover:text-[var(--color-brand)]">
                     How it works
@@ -117,6 +143,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                   <Link href="/faq" className="hover:text-[var(--color-brand)]">
                     FAQ
                   </Link>
+                  <Link href="/status" className="hover:text-[var(--color-brand)]">
+                    Status
+                  </Link>
                   <a
                     href="https://godgift-care.github.io/sci-healthcare-contracts/"
                     target="_blank"
@@ -128,6 +157,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 </nav>
               </div>
             </footer>
+            </LocaleProvider>
           </SwrProvider>
         </WalletProvider>
       </body>

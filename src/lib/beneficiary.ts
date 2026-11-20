@@ -46,29 +46,482 @@ export function isValidRef(ref: string): boolean {
   return /^[0-9a-f]{64}$/.test(ref);
 }
 
-const KEY_STORAGE = 'sci:beneficiary-key';
-const ID_STORAGE = 'sci:beneficiary-id';
+/**
+ * Whether a patient reference and key derive the voucher's beneficiary
+ * reference.
+ *
+ * Used by the clinic's verify panel (#33). Everything stays in this
+ * browser: the identifier and key are hashed locally with `beneficiaryRef`
+ * and only this boolean is handed back. A malformed reference simply does
+ * not match; invalid input (empty identifier, short key) rejects so the
+ * panel can explain what to fix.
+ */
+export async function matchesBeneficiaryRef(
+  expectedRef: string,
+  identifier: string,
+  key: string,
+): Promise<boolean> {
+  const derived = await beneficiaryRef(identifier, key);
+  return derived === expectedRef.trim().toLowerCase();
+}
 
-/** Convenience persistence so a demo user does not retype these. */
+export type SavedPatient = { nickname: string; identifier: string; key: string };
+
+/**
+ * Reads a patient backup: a file or text holding JSON (the app's own backup
+ * format and a few common shapes), or "reference | key" on one line. The
+ * result is a saved patient ready for `localIdentity.save`.
+ */
+function normalisePatientValue(value: unknown): string {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return '';
+}
+
+function parseMaybeJson(data: string): unknown {
+  const trimmed = data.trim();
+  if (!trimmed) throw new Error('The patient backup is empty.');
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return data;
+  }
+}
+
+function parseSavedPatientRecord(value: unknown): SavedPatient {
+  if (typeof value === 'string') {
+    const cleaned = value.trim();
+    if (!cleaned) throw new Error('The patient backup is empty.');
+
+    const parsed = parseMaybeJson(cleaned);
+    if (parsed !== cleaned) return parseSavedPatientRecord(parsed);
+
+    const [idPart, keyPart] = cleaned.split(/\s*\|\s*|\r?\n/).map((part) => part.trim());
+    if (idPart && keyPart) {
+      return { nickname: idPart, identifier: idPart, key: keyPart };
+    }
+
+    throw new Error('The backup must be a JSON object with an identifier and key.');
+  }
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) throw new Error('This patient backup is empty.');
+    return parseSavedPatientRecord(value[0]);
+  }
+
+  if (typeof value !== 'object' || value === null) {
+    throw new Error('The backup must contain a patient identifier and key.');
+  }
+
+  const record = value as Record<string, unknown>;
+  const nested =
+    record.patient ??
+    record.identity ??
+    record.savedPatient ??
+    record.data ??
+    record.record ??
+    record;
+
+  const identifier = normalisePatientValue(
+    (nested as Record<string, unknown>).identifier ??
+      (nested as Record<string, unknown>).patientId ??
+      (nested as Record<string, unknown>).patientIdentifier ??
+      (nested as Record<string, unknown>).reference ??
+      (nested as Record<string, unknown>).patient_ref ??
+      record.identifier ??
+      record.patientId ??
+      record.patientIdentifier ??
+      record.reference,
+  );
+
+  const key = normalisePatientValue(
+    (nested as Record<string, unknown>).key ??
+      (nested as Record<string, unknown>).secretKey ??
+      (nested as Record<string, unknown>).patientKey ??
+      (nested as Record<string, unknown>).secret ??
+      record.key ??
+      record.secretKey ??
+      record.patientKey ??
+      record.secret,
+  );
+
+  if (!identifier) throw new Error('This backup is missing a patient reference.');
+  if (!key) throw new Error('This backup is missing a patient key.');
+  if (key.length < 32) throw new Error('The patient key must be at least 32 characters long.');
+
+  // Backups made by this app carry a nickname; anything else is listed under
+  // its patient reference, which only ever lives on this device.
+  const nickname =
+    normalisePatientValue(
+      (nested as Record<string, unknown>).nickname ?? record.nickname ?? record.name,
+    ) || identifier;
+  return { nickname, identifier, key };
+}
+
+export async function parsePatientBackup(input: string | File | unknown): Promise<SavedPatient> {
+  if (input instanceof File) {
+    return parseSavedPatientRecord(await input.text());
+  }
+  if (typeof input === 'string') {
+    return parseSavedPatientRecord(parseMaybeJson(input));
+  }
+  return parseSavedPatientRecord(input);
+}
+
+/**
+ * Turns a saved patient into the backup text that `parsePatientBackup`
+ * reads back: JSON with the nickname (when there is one), reference and key.
+ * Whoever holds it can look up the patient's care history.
+ */
+export function serialisePatientBackup(patient: {
+  nickname?: string;
+  identifier: string;
+  key: string;
+  createdAt?: string;
+}): string {
+  const identifier = patient.identifier.trim();
+  const key = patient.key.trim();
+  const nickname = patient.nickname?.trim();
+
+  if (!identifier) throw new Error('This backup is missing a patient reference.');
+  if (!key) throw new Error('This backup is missing a patient key.');
+  if (key.length < 32) throw new Error('The patient key must be at least 32 characters long.');
+
+  return JSON.stringify(
+    {
+      ...(nickname ? { nickname } : {}),
+      identifier,
+      key,
+      ...(patient.createdAt ? { createdAt: patient.createdAt } : {}),
+    },
+    null,
+    2,
+  );
+}
+
+type SavedPatientStore = {
+  patients: SavedPatient[];
+  selectedNickname: string;
+  encrypted: boolean;
+  locked: boolean;
+};
+
+type EncryptedPatients = {
+  version: 1;
+  kdf: 'PBKDF2-SHA-256';
+  iterations: number;
+  salt: string;
+  iv: string;
+  ciphertext: string;
+};
+
+const PATIENTS_STORAGE = 'sci:saved-patients';
+const SELECTED_STORAGE = 'sci:selected-patient';
+const LEGACY_KEY_STORAGE = 'sci:beneficiary-key';
+const LEGACY_ID_STORAGE = 'sci:beneficiary-id';
+const PATIENTS_CHANGED = 'sci:saved-patients-changed';
+const PBKDF2_ITERATIONS = 310_000;
+
+let unlockedKey: CryptoKey | null = null;
+let unlockedPatients: SavedPatient[] | null = null;
+let unlockedSelectedNickname = '';
+
+function encodeBytes(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function decodeBytes(value: string): Uint8Array {
+  return Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+}
+
+function parseEncryptedPatients(value: string | null): EncryptedPatients | null {
+  if (!value) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      'version' in parsed &&
+      parsed.version === 1 &&
+      'kdf' in parsed &&
+      parsed.kdf === 'PBKDF2-SHA-256' &&
+      'iterations' in parsed &&
+      typeof parsed.iterations === 'number' &&
+      Number.isInteger(parsed.iterations) &&
+      parsed.iterations >= 100_000 &&
+      parsed.iterations <= 1_000_000 &&
+      'salt' in parsed &&
+      typeof parsed.salt === 'string' &&
+      'iv' in parsed &&
+      typeof parsed.iv === 'string' &&
+      'ciphertext' in parsed &&
+      typeof parsed.ciphertext === 'string'
+    ) {
+      return parsed as EncryptedPatients;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function deriveStorageKey(passphrase: string, salt: Uint8Array, iterations: number) {
+  const material = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(passphrase),
+    'PBKDF2',
+    false,
+    ['deriveKey'],
+  );
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+    material,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
+async function encryptPatients(
+  patients: SavedPatient[],
+  selectedNickname: string,
+  key: CryptoKey,
+): Promise<EncryptedPatients> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    new TextEncoder().encode(JSON.stringify({ patients, selectedNickname })),
+  );
+  return {
+    version: 1,
+    kdf: 'PBKDF2-SHA-256',
+    iterations: PBKDF2_ITERATIONS,
+    salt: '',
+    iv: encodeBytes(iv),
+    ciphertext: encodeBytes(new Uint8Array(ciphertext)),
+  };
+}
+
+async function decryptPatients(envelope: EncryptedPatients, passphrase: string) {
+  const key = await deriveStorageKey(
+    passphrase,
+    decodeBytes(envelope.salt),
+    envelope.iterations,
+  );
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: decodeBytes(envelope.iv) },
+    key,
+    decodeBytes(envelope.ciphertext),
+  );
+  const parsed: unknown = JSON.parse(new TextDecoder().decode(plaintext));
+  if (typeof parsed !== 'object' || parsed === null || !('patients' in parsed)) {
+    throw new Error('The encrypted patient data is invalid.');
+  }
+  const patients = readPatients(JSON.stringify(parsed.patients));
+  const selectedNickname =
+    'selectedNickname' in parsed && typeof parsed.selectedNickname === 'string'
+      ? parsed.selectedNickname
+      : '';
+  return { key, patients, selectedNickname };
+}
+
+function readPatients(value: string | null): SavedPatient[] {
+  if (!value) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (patient): patient is SavedPatient =>
+        typeof patient?.nickname === 'string' &&
+        typeof patient?.identifier === 'string' &&
+        typeof patient?.key === 'string',
+    );
+  } catch {
+    return [];
+  }
+}
+
+function announcePatientsChanged(): void {
+  window.dispatchEvent(new Event(PATIENTS_CHANGED));
+}
+
+async function persist(store: SavedPatientStore): Promise<boolean> {
+  try {
+    if (unlockedKey) {
+      const envelope = await encryptPatients(
+        store.patients,
+        store.selectedNickname,
+        unlockedKey,
+      );
+      const existing = parseEncryptedPatients(localStorage.getItem(PATIENTS_STORAGE));
+      if (!existing) return false;
+      envelope.salt = existing.salt;
+      localStorage.setItem(PATIENTS_STORAGE, JSON.stringify(envelope));
+      localStorage.removeItem(SELECTED_STORAGE);
+      unlockedPatients = store.patients;
+      unlockedSelectedNickname = store.selectedNickname;
+    } else {
+      localStorage.setItem(PATIENTS_STORAGE, JSON.stringify(store.patients));
+    }
+    if (store.selectedNickname) {
+      localStorage.setItem(SELECTED_STORAGE, store.selectedNickname);
+    } else {
+      localStorage.removeItem(SELECTED_STORAGE);
+    }
+    announcePatientsChanged();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Patient references and keys are persisted only in this browser's storage. */
 export const localIdentity = {
-  load(): { identifier: string; key: string } {
-    if (typeof window === 'undefined') return { identifier: '', key: '' };
+  load(): SavedPatientStore {
+    if (typeof window === 'undefined') {
+      return { patients: [], selectedNickname: '', encrypted: false, locked: false };
+    }
     try {
-      return {
-        identifier: localStorage.getItem(ID_STORAGE) ?? '',
-        key: localStorage.getItem(KEY_STORAGE) ?? '',
-      };
+      const stored = localStorage.getItem(PATIENTS_STORAGE);
+      const encrypted = parseEncryptedPatients(stored);
+      if (encrypted) {
+        const patients = unlockedKey && unlockedPatients ? unlockedPatients : [];
+        const selectedNickname = patients.some(
+          (patient) => patient.nickname === unlockedSelectedNickname,
+        )
+          ? unlockedSelectedNickname
+          : patients.at(-1)?.nickname ?? '';
+        return {
+          patients,
+          selectedNickname,
+          encrypted: true,
+          locked: !unlockedKey,
+        };
+      }
+      let patients = readPatients(stored);
+      if (stored === null) {
+        const identifier = localStorage.getItem(LEGACY_ID_STORAGE) ?? '';
+        const key = localStorage.getItem(LEGACY_KEY_STORAGE) ?? '';
+        if (identifier && key) {
+          patients = [{ nickname: 'Saved patient', identifier, key }];
+          localStorage.setItem(PATIENTS_STORAGE, JSON.stringify(patients));
+          localStorage.removeItem(LEGACY_ID_STORAGE);
+          localStorage.removeItem(LEGACY_KEY_STORAGE);
+        }
+      }
+      const requested = localStorage.getItem(SELECTED_STORAGE) ?? '';
+      const selectedNickname = patients.some((patient) => patient.nickname === requested)
+        ? requested
+        : patients.at(-1)?.nickname ?? '';
+      return { patients, selectedNickname, encrypted: false, locked: false };
     } catch {
-      return { identifier: '', key: '' };
+      return { patients: [], selectedNickname: '', encrypted: false, locked: false };
     }
   },
-  save(identifier: string, key: string): void {
+  async enableEncryption(passphrase: string): Promise<boolean> {
+    if (typeof window === 'undefined' || passphrase.length < 12) return false;
     try {
-      localStorage.setItem(ID_STORAGE, identifier);
-      localStorage.setItem(KEY_STORAGE, key);
+      const stored = localStorage.getItem(PATIENTS_STORAGE);
+      if (parseEncryptedPatients(stored)) return false;
+      const { patients } = this.load();
+      const selectedNickname = localStorage.getItem(SELECTED_STORAGE) ?? '';
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const storageKey = await deriveStorageKey(passphrase, salt, PBKDF2_ITERATIONS);
+      const envelope = await encryptPatients(patients, selectedNickname, storageKey);
+      envelope.salt = encodeBytes(salt);
+      localStorage.setItem(PATIENTS_STORAGE, JSON.stringify(envelope));
+      localStorage.removeItem(SELECTED_STORAGE);
+      localStorage.removeItem(LEGACY_ID_STORAGE);
+      localStorage.removeItem(LEGACY_KEY_STORAGE);
+      unlockedKey = storageKey;
+      unlockedPatients = patients;
+      unlockedSelectedNickname = selectedNickname;
+      announcePatientsChanged();
+      return true;
     } catch {
-      // Private browsing or blocked storage; the app still works, the user
-      // just retypes.
+      return false;
     }
+  },
+  async unlock(passphrase: string): Promise<boolean> {
+    if (typeof window === 'undefined') return false;
+    try {
+      const envelope = parseEncryptedPatients(localStorage.getItem(PATIENTS_STORAGE));
+      if (!envelope) return false;
+      const result = await decryptPatients(envelope, passphrase);
+      unlockedKey = result.key;
+      unlockedPatients = result.patients;
+      unlockedSelectedNickname = result.selectedNickname;
+      announcePatientsChanged();
+      return true;
+    } catch {
+      this.lock();
+      return false;
+    }
+  },
+  lock(): void {
+    unlockedKey = null;
+    unlockedPatients = null;
+    unlockedSelectedNickname = '';
+    if (typeof window !== 'undefined') announcePatientsChanged();
+  },
+  async save(nickname: string, identifier: string, key: string): Promise<boolean> {
+    const cleanNickname = nickname.trim();
+    if (!cleanNickname) return false;
+    const store = this.load();
+    if (store.locked) return false;
+    const { patients } = store;
+    const existing = patients.findIndex(
+      (patient) => patient.nickname.toLowerCase() === cleanNickname.toLowerCase(),
+    );
+    const patient = { nickname: cleanNickname, identifier, key };
+    const next = [...patients];
+    if (existing >= 0) next[existing] = patient;
+    else next.push(patient);
+    return persist({ ...store, patients: next, selectedNickname: cleanNickname });
+  },
+  async select(nickname: string): Promise<boolean> {
+    const store = this.load();
+    if (store.locked) return false;
+    const { patients } = store;
+    if (nickname && !patients.some((patient) => patient.nickname === nickname)) return false;
+    return persist({ ...store, patients, selectedNickname: nickname });
+  },
+  async rename(currentNickname: string, newNickname: string): Promise<boolean> {
+    const cleanNickname = newNickname.trim();
+    if (!cleanNickname) return false;
+    const store = this.load();
+    if (store.locked) return false;
+    const { patients, selectedNickname } = store;
+    if (
+      patients.some(
+        (patient) =>
+          patient.nickname !== currentNickname &&
+          patient.nickname.toLowerCase() === cleanNickname.toLowerCase(),
+      )
+    ) {
+      return false;
+    }
+    const next = patients.map((patient) =>
+      patient.nickname === currentNickname
+        ? { ...patient, nickname: cleanNickname }
+        : patient,
+    );
+    if (!next.some((patient) => patient.nickname === cleanNickname)) return false;
+    return persist({ ...store,
+      patients: next,
+      selectedNickname: selectedNickname === currentNickname ? cleanNickname : selectedNickname,
+    });
+  },
+  async remove(nickname: string): Promise<boolean> {
+    const store = this.load();
+    if (store.locked) return false;
+    const { patients, selectedNickname } = store;
+    const next = patients.filter((patient) => patient.nickname !== nickname);
+    if (next.length === patients.length) return false;
+    const nextSelected = selectedNickname === nickname ? next.at(-1)?.nickname ?? '' : selectedNickname;
+    return persist({ ...store, patients: next, selectedNickname: nextSelected });
   },
 };

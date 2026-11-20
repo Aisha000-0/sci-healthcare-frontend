@@ -1,16 +1,44 @@
 'use client';
 
-import Link from 'next/link';
-import { use, useState } from 'react';
+import { DetailLink } from '@/components/DetailLink';
+import { notFound } from 'next/navigation';
+import { use, useEffect, useState } from 'react';
 
-import { formatDate, formatUsdc } from '@/lib/amounts';
+import { ApiError } from '@/lib/api';
+import { formatCurrency, formatDate, formatUsdc } from '@/lib/amounts';
 import { config, explorerContract, explorerTx } from '@/lib/config';
-import { useLiveUpdates, useNameIndex, useNow, useVoucher, useVoucherEvents } from '@/lib/hooks';
+import { humaniseError, VOUCHER_ERRORS } from '@/lib/errors';
+import {
+  useLiveUpdates,
+  useNameIndex,
+  useNow,
+  useProviders,
+  useVoucher,
+  useVoucherEvents,
+} from '@/lib/hooks';
+import { voucher as voucherContract } from '@/lib/protocol';
+import { eligibleRedirects } from '@/lib/redirect';
+import { problemReportUrl } from '@/lib/report-problem';
+import { rememberRecentVoucherId } from '@/lib/recent-vouchers';
 import { stepTxHashes, voucherTimeline, type StepState } from '@/lib/timeline';
 import { useWallet } from '@/lib/wallet';
 import { CopyValue } from '@/components/CopyValue';
+import { SkeletonDetail } from '@/components/Skeleton';
+import { VoucherQr } from '@/components/VoucherQr';
 import { VoucherRow } from '@/components/VoucherRow';
-import { Alert, Card, ExplorerLink, Field, StatusBadge } from '@/components/ui';
+import { Alert, Button, Card, ExplorerLink, Field, Modal, StatusBadge } from '@/components/ui';
+import { useToast } from '@/components/Toast';
+import { buildVoucherExpiryIcs } from '@/lib/ics';
+import { useLocaleContext } from '@/i18n/LocaleContext';
+
+/**
+ * Voucher ids are positive integers. Anything else (empty, non-numeric,
+ * negative, zero, decimals) is not a voucher and must not reach the API.
+ */
+function isValidVoucherId(id: string): boolean {
+  if (!/^[1-9]\d*$/.test(id)) return false;
+  return Number.isSafeInteger(Number(id));
+}
 
 /**
  * One voucher, end to end: what it pays for, where it is in its lifecycle,
@@ -21,10 +49,22 @@ import { Alert, Card, ExplorerLink, Field, StatusBadge } from '@/components/ui';
  */
 export default function VoucherPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
-  const { address } = useWallet();
+  const { address, signTransaction } = useWallet();
+  const { t, locale } = useLocaleContext();
+  const toast = useToast();
   const now = useNow();
   const names = useNameIndex();
   const [copied, setCopied] = useState(false);
+  const [redirectOpen, setRedirectOpen] = useState(false);
+  const [redirectTarget, setRedirectTarget] = useState<string | null>(null);
+  const [redirectBusy, setRedirectBusy] = useState(false);
+
+  function voucherShareMessage() {
+    const url = new URL(`/vouchers/${id}`, window.location.origin).toString();
+    return `A healthcare voucher is ready for you: ${url}`;
+  }
+  // Validate before any hook fires a request: an invalid id is a missing page.
+  const validId = isValidVoucherId(id);
 
   async function copyLink() {
     try {
@@ -37,15 +77,42 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
     }
   }
 
-  const { voucher: v, error, mutate } = useVoucher(id);
+  async function shareVoucher() {
+    const message = voucherShareMessage();
+    if (typeof navigator.share !== 'function') {
+      await copyLink();
+      return;
+    }
+    try {
+      await navigator.share({ title: 'Healthcare voucher', text: message });
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === 'AbortError')) {
+        await copyLink();
+      }
+    }
+  }
+
+  const { voucher: v, error, rawError, mutate } = useVoucher(validId ? id : undefined);
+  // Only fetched once the funder opens the move dialog (#287).
+  const { providers: redirectProviders, isLoading: redirectLoading } = useProviders(
+    redirectOpen ? { status: 'Active' } : null,
+  );
+  const loadedVoucherId = v?.id;
+  useEffect(() => {
+    if (loadedVoucherId) rememberRecentVoucherId(loadedVoucherId);
+  }, [loadedVoucherId]);
+
   // Per-step transaction hashes (#18). An indexer without the events
   // endpoint (backend #13) yields an empty list and the history renders
   // exactly as before, only without the "view transaction" links.
-  const { events } = useVoucherEvents(id);
-  useLiveUpdates({ voucherId: id });
+  const { events } = useVoucherEvents(validId ? id : undefined);
+  useLiveUpdates({ voucherId: validId ? id : undefined });
 
+  if (!validId) notFound();
+  // An unknown voucher number is a missing page, not an API failure.
+  if (rawError instanceof ApiError && rawError.status === 404) notFound();
   if (error) return <Alert>{error}</Alert>;
-  if (!v) return <p className="text-sm text-[var(--color-ink-soft)]">Loading voucher…</p>;
+  if (!v) return <SkeletonDetail />;
 
   // Offer the actions this wallet can take. settle and refund are
   // permissionless, so anyone may trigger them once they are due.
@@ -58,12 +125,87 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
 
   const steps = voucherTimeline(v, v.receipt, now, stepTxHashes(events));
 
+  // The contract will only accept an active clinic that offers this service
+  // at or below the escrow (#287).
+  const redirectCandidates = eligibleRedirects(redirectProviders, {
+    serviceCode: v.serviceCode,
+    amount: BigInt(v.amount),
+    exclude: v.provider.address,
+  });
+  const redirectChosen =
+    redirectCandidates.find((candidate) => candidate.address === redirectTarget) ??
+    null;
+
+  async function confirmRedirect() {
+    if (!address || !redirectChosen || !v) return;
+    setRedirectBusy(true);
+    try {
+      const result = await voucherContract.redirect(
+        address,
+        v.id,
+        redirectChosen.address,
+        signTransaction,
+      );
+      await mutate();
+      toast.success(
+        <>
+          {t('voucher.redirect.success', { clinic: redirectChosen.name })}{' '}
+          <ExplorerLink href={explorerTx(result.hash)}>
+            {t('common.viewTransaction')}
+          </ExplorerLink>
+        </>,
+      );
+      setRedirectOpen(false);
+      setRedirectTarget(null);
+    } catch (err) {
+      toast.error(humaniseError(err, VOUCHER_ERRORS));
+    } finally {
+      setRedirectBusy(false);
+    }
+  }
+
+  function addToCalendar() {
+    if (!v || typeof window === 'undefined') return;
+    const expiresAtMs =
+      typeof v.expiresAt === 'string' ? Date.parse(v.expiresAt) : v.expiresAt.getTime();
+    const expiresAt = Math.floor(expiresAtMs / 1000);
+    const ics = buildVoucherExpiryIcs({
+      id: v.id,
+      expiresAt,
+      serviceLabel: v.serviceLabel ?? `Service ${v.serviceCode}`,
+      voucherUrl: window.location.href,
+    });
+    const blob = new Blob([ics], { type: 'text/calendar;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `voucher-${v.id}-expiry.ics`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  // Public facts only: the builder takes a narrow shape and deliberately
+  // drops the beneficiary reference, funder address and every patient value
+  // (#138).
+  const reportHref = problemReportUrl({
+    id: v.id,
+    status: v.status,
+    service: v.serviceLabel ?? `Service ${v.serviceCode}`,
+    clinic: v.provider.name,
+  });
+  const shareMessage = voucherShareMessage();
+  const encodedShareMessage = encodeURIComponent(shareMessage);
+
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-4">
+    <div className="voucher-print-page space-y-6 print:space-y-3">
+      <div className="flex flex-wrap items-start justify-between gap-4 print:hidden">
         <div>
           <div className="flex flex-wrap items-center gap-2">
-            <span className="mono text-xs text-[var(--color-ink-soft)]">Voucher #{v.id}</span>
+            <span className="mono text-xs text-[var(--color-ink-soft)]">
+              {t('voucher.voucherNumber', { id: v.id })}
+            </span>
             <StatusBadge status={v.status} />
             <button
               type="button"
@@ -72,7 +214,7 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
               aria-label="Copy link"
             >
               {copied ? (
-                <span className="font-medium text-emerald-700">Link copied!</span>
+                <span className="font-medium text-emerald-700">{t('voucher.linkCopied')}</span>
               ) : (
                 <>
                   <svg
@@ -88,32 +230,63 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
                     <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
                     <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
                   </svg>
-                  <span>Copy link</span>
+                  <span>{t('voucher.copyLink')}</span>
                 </>
               )}
             </button>
+            <button
+              type="button"
+              onClick={() => void shareVoucher()}
+              className="inline-flex items-center rounded-md border border-[var(--color-line)] bg-[var(--color-surface)] px-2 py-0.5 text-xs font-medium text-[var(--color-ink-soft)] transition hover:border-[var(--color-brand)] hover:text-[var(--color-ink)]"
+              aria-label="Share voucher"
+            >
+              Share
+            </button>
+            <a
+              href={`https://wa.me/?text=${encodedShareMessage}`}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center rounded-md border border-[var(--color-line)] bg-[var(--color-surface)] px-2 py-0.5 text-xs font-medium text-[var(--color-ink-soft)] transition hover:border-[var(--color-brand)] hover:text-[var(--color-ink)]"
+            >
+              WhatsApp
+            </a>
+            <a
+              href={`sms:?body=${encodedShareMessage}`}
+              className="inline-flex items-center rounded-md border border-[var(--color-line)] bg-[var(--color-surface)] px-2 py-0.5 text-xs font-medium text-[var(--color-ink-soft)] transition hover:border-[var(--color-brand)] hover:text-[var(--color-ink)]"
+            >
+              SMS
+            </a>
           </div>
           <h1 className="mt-1 text-xl font-semibold tracking-tight">
             {v.serviceLabel ?? `Service ${v.serviceCode}`}
           </h1>
           <p className="text-sm text-[var(--color-ink-soft)]">
-            at{' '}
-            <Link href={`/clinics/${v.provider.address}`} className="underline underline-offset-2">
+            {t('voucher.at')}{' '}
+            <DetailLink detail={{ kind: 'clinic', id: v.provider.address }} className="underline underline-offset-2">
               {v.provider.name}
-            </Link>{' '}
+            </DetailLink>{' '}
             · {v.provider.country}
           </p>
         </div>
-        <div className="text-right">
-          <div className="mono text-2xl font-semibold">${formatUsdc(v.amount)}</div>
-          <div className="text-xs text-[var(--color-ink-soft)]">USDC</div>
+        <div className="text-end">
+          <div className="mono text-2xl font-semibold">${formatUsdc(v.amount, locale)}</div>
+          <div className="text-xs text-[var(--color-ink-soft)]">{t('common.usdc')}</div>
         </div>
       </div>
 
-      <div className="grid gap-6 md:grid-cols-[2fr_1fr]">
-        <Card className="p-5">
-          <h2 className="text-sm font-semibold">History</h2>
-          <ol className="mt-4 space-y-4">
+      <VoucherQr
+        voucherId={v.id}
+        contractAddress={config.contracts.voucher}
+        serviceLabel={v.serviceLabel ?? `Service ${v.serviceCode}`}
+        providerName={v.provider.name}
+        amount={formatUsdc(v.amount, locale)}
+        expiresAt={formatDate(v.expiresAt, locale)}
+      />
+
+      <div className="grid gap-6 md:grid-cols-[2fr_1fr] print:grid-cols-[2fr_1fr] print:gap-3">
+        <Card className="voucher-print-history p-5 print:p-3">
+          <h2 className="text-sm font-semibold">{t('voucher.history')}</h2>
+          <ol className="mt-4 space-y-4 print:mt-2 print:space-y-2">
             {steps.map((s) => (
               <li key={s.label} className="flex gap-3">
                 <span
@@ -127,12 +300,12 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
                   </div>
                   <div className="text-xs text-[var(--color-ink-soft)]">
                     {s.detail}
-                    {s.at && ` · ${formatDate(s.at)}`}
+                    {s.at && ` · ${formatDate(s.at, locale)}`}
                     {s.txHash && (
                       <>
                         {' · '}
                         <ExplorerLink href={explorerTx(s.txHash)}>
-                          View transaction
+                          {t('common.viewTransaction')}
                         </ExplorerLink>
                       </>
                     )}
@@ -143,58 +316,184 @@ export default function VoucherPage({ params }: { params: Promise<{ id: string }
           </ol>
         </Card>
 
-        <Card className="space-y-4 p-5">
-          <Field label="Funded by">
-            <CopyValue value={v.funder} name={names.get(v.funder)} label="funder address" />
+        <Card className="voucher-print-history space-y-4 p-5 print:space-y-2 print:p-3">
+          <div className="print:hidden">
+            <Field label={t('voucher.fundedBy')}>
+              <CopyValue value={v.funder} name={names.get(v.funder)} label="funder address" />
+            </Field>
+          </div>
+          <Field label={t('voucher.expires')}>
+            <div className="flex items-center gap-2">
+              {formatDate(v.expiresAt, locale)}
+              <button
+                type="button"
+                onClick={addToCalendar}
+                className="inline-flex items-center gap-1 rounded-md border border-[var(--color-line)] bg-[var(--color-surface)] px-2 py-0.5 text-xs font-medium text-[var(--color-ink-soft)] transition hover:border-[var(--color-brand)] hover:text-[var(--color-ink)]"
+                aria-label={t('voucher.addToCalendar')}
+              >
+                {t('voucher.addToCalendar')}
+              </button>
+            </div>
           </Field>
-          <Field label="Expires">{formatDate(v.expiresAt)}</Field>
           {v.status === 'Settled' && v.settledNet && (
-            <Field label="Clinic received">
-              <span className="mono">${formatUsdc(v.settledNet)}</span>
+            <Field label={t('voucher.clinicReceived')}>
+              <span className="mono">${formatUsdc(v.settledNet, locale)}</span>
               {v.settledFee && (
                 <span className="text-xs text-[var(--color-ink-soft)]">
                   {' '}
-                  (fee ${formatUsdc(v.settledFee)})
+                  ({t('voucher.fee')} ${formatUsdc(v.settledFee, locale)})
                 </span>
               )}
             </Field>
           )}
           {v.disputeOutcome && (
-            <Field label="Dispute outcome">
+            <Field label={t('voucher.disputeOutcome')}>
               <span className="font-medium">
                 {v.disputeOutcome}
-                {v.disputeResolvedAt && ` · ${formatDate(v.disputeResolvedAt)}`}
+                {v.disputeResolvedAt && ` · ${formatDate(v.disputeResolvedAt, locale)}`}
               </span>
             </Field>
           )}
           {v.receipt && (
-            <Field label="Care receipt">Minted {formatDate(v.receipt.settledAt)}</Field>
+            <Field label={t('voucher.careReceipt')}>{t('voucher.minted')} {formatDate(v.receipt.settledAt, locale)}</Field>
           )}
-          <Field label="Patient reference">
-            <CopyValue
-              value={v.beneficiaryRef}
-              display={`${v.beneficiaryRef.slice(0, 16)}…`}
-              label="patient reference"
-            />
-          </Field>
-          <p className="text-xs text-[var(--color-ink-soft)]">
-            The patient reference is an opaque hash. It cannot be turned back into a
-            name or record number.
-          </p>
-          <ExplorerLink href={explorerContract(config.contracts.voucher)}>
-            View the voucher contract
-          </ExplorerLink>
+          <div className="space-y-4 print:hidden">
+            <Field label={t('voucher.patientReference')}>
+              <CopyValue
+                value={v.beneficiaryRef}
+                display={`${v.beneficiaryRef.slice(0, 16)}…`}
+                label="patient reference"
+              />
+            </Field>
+            <p className="text-xs text-[var(--color-ink-soft)]">
+              {t('voucher.patientReferenceNote')}
+            </p>
+            <ExplorerLink href={explorerContract(config.contracts.voucher)}>
+              {t('voucher.viewContract')}
+            </ExplorerLink>
+          </div>
         </Card>
       </div>
 
-      <VoucherRow
-        v={v}
-        actions={[...actions]}
-        onDone={() => {
-          void mutate();
+      {/* A funded voucher whose clinic cannot deliver can be moved before
+          the patient attends (#287). Only the funder may redirect it. */}
+      {address === v.funder && v.status === 'Funded' && (
+        <Card className="print:hidden flex flex-wrap items-center justify-between gap-3 p-5">
+          <div>
+            <h2 className="text-sm font-semibold">{t('voucher.redirect.action')}</h2>
+            <p className="mt-1 text-xs text-[var(--color-ink-soft)]">
+              {t('voucher.redirect.intro', {
+                amount: formatCurrency(v.amount, 'USD', locale),
+              })}
+            </p>
+          </div>
+          <Button variant="ghost" onClick={() => setRedirectOpen(true)}>
+            {t('voucher.redirect.action')}
+          </Button>
+        </Card>
+      )}
+
+      <Modal
+        open={redirectOpen}
+        onClose={() => {
+          if (!redirectBusy) setRedirectOpen(false);
         }}
-        summary={false}
-      />
+        title={t('voucher.redirect.title', { id: v.id })}
+        actions={
+          <>
+            <Button
+              disabled={!redirectChosen || redirectBusy}
+              onClick={() => void confirmRedirect()}
+            >
+              {redirectBusy ? t('voucher.redirect.moving') : t('voucher.redirect.confirm')}
+            </Button>
+            <Button
+              variant="ghost"
+              disabled={redirectBusy}
+              onClick={() => setRedirectOpen(false)}
+            >
+              {t('common.cancel')}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          {redirectLoading ? (
+            <p role="status">{t('voucher.redirect.loading')}</p>
+          ) : redirectCandidates.length === 0 ? (
+            <p>
+              {t('voucher.redirect.empty', {
+                amount: formatCurrency(v.amount, 'USD', locale),
+              })}
+            </p>
+          ) : (
+            <>
+              <label className="block">
+                <span className="text-xs uppercase tracking-wide text-[var(--color-ink-soft)]">
+                  {t('voucher.redirect.choose')}
+                </span>
+                <select
+                  value={redirectTarget ?? ''}
+                  onChange={(event) => setRedirectTarget(event.target.value || null)}
+                  className="mt-1 w-full rounded-lg border border-[var(--color-line)] bg-[var(--color-surface)] px-3 py-2 text-sm"
+                >
+                  <option value="">—</option>
+                  {redirectCandidates.map((candidate) => (
+                    <option key={candidate.address} value={candidate.address}>
+                      {t('voucher.redirect.option', {
+                        clinic: candidate.name,
+                        price: formatCurrency(candidate.price, 'USD', locale),
+                      })}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {redirectChosen && (
+                <p className="text-sm">
+                  {t('voucher.redirect.confirmIntro', {
+                    clinic: redirectChosen.name,
+                    price: formatCurrency(redirectChosen.price, 'USD', locale),
+                    amount: formatCurrency(v.amount, 'USD', locale),
+                  })}
+                </p>
+              )}
+            </>
+          )}
+        </div>
+      </Modal>
+
+      {/* The clinic can also claim from a scanned voucher link; the patient
+          check guards that path too (#33). */}
+      <div className="print:hidden">
+        <VoucherRow
+          v={v}
+          actions={[...actions]}
+          onDone={() => {
+            void mutate();
+          }}
+          summary={false}
+          requirePatientMatch
+        />
+      </div>
+
+      {/* Only the funder can dispute, but anyone who notices a problem can
+          report it (#138). The prefilled issue carries public voucher
+          details only — never the patient reference. */}
+      <Card className="print:hidden space-y-2 p-5">
+        <h2 className="text-sm font-semibold">{t('voucher.reportProblem')}</h2>
+        <p className="text-xs leading-relaxed text-[var(--color-ink-soft)]">
+          {t('voucher.reportProblemIntro')}
+        </p>
+        <a
+          href={reportHref}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-1 text-sm font-medium text-[var(--color-brand)] underline underline-offset-2 hover:opacity-80"
+        >
+          {t('voucher.reportProblemAction')}
+          <span aria-hidden="true">↗</span>
+        </a>
+      </Card>
     </div>
   );
 }

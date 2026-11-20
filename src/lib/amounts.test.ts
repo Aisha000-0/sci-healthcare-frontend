@@ -5,9 +5,11 @@ import {
   formatDate,
   formatUsdc,
   shortAddress,
+  timeSince,
   timeUntil,
   toAmountInput,
   toBaseUnits,
+  validateAmountInput,
 } from './amounts';
 
 /**
@@ -65,6 +67,26 @@ describe('toBaseUnits', () => {
   });
 });
 
+describe('validateAmountInput', () => {
+  it('accepts valid amounts at or above the minimum', () => {
+    expect(validateAmountInput('3.00', 30_000_000n)).toBeNull();
+    expect(validateAmountInput('3.0000001', 30_000_000n)).toBeNull();
+  });
+
+  it('rejects malformed values and precision beyond seven decimals', () => {
+    expect(validateAmountInput('not a number', 1n)).toBe('Enter a valid amount.');
+    expect(validateAmountInput('1.00000000', 1n)).toBe(
+      'Use no more than 7 decimal places.',
+    );
+  });
+
+  it('requires at least the listed price', () => {
+    expect(validateAmountInput('2.99', 30_000_000n)).toBe(
+      'The listed price is $3.00. Enter at least that.',
+    );
+  });
+});
+
 describe('formatUsdc', () => {
   it('formats a zero balance to two decimals', () => {
     expect(formatUsdc(0n)).toBe('0.00');
@@ -87,6 +109,7 @@ describe('formatUsdc', () => {
   it('groups thousands for display', () => {
     expect(formatUsdc(1_000_000_000n)).toBe('100.00');
     expect(formatUsdc(1_000_000_000_000n)).toBe('100,000.00');
+    expect(formatUsdc(1_000_000_000_000n, 'yo')).toBe('100,000.00');
   });
 
   it('accepts bigint and string alike', () => {
@@ -136,6 +159,14 @@ describe('formatDate', () => {
     expect(formatDate(new Date('2026-01-02T00:00:00.000Z'))).toBe('2 Jan 2026');
   });
 
+  it('renders dates per locale', () => {
+    const d = new Date('2026-05-20T10:00:00.000Z');
+    expect(formatDate(d, 'fr')).toMatch(/20/);
+    expect(formatDate(d, 'sw')).toMatch(/20/);
+    // Yoruba month names come from the locale, not the English fallback.
+    expect(formatDate(d, 'yo')).toBe('20 Oṣù Ẹ̀bibi 2026');
+  });
+
   it('renders a dash for missing dates', () => {
     expect(formatDate(null)).toBe('—');
   });
@@ -154,13 +185,17 @@ describe('timeUntil', () => {
   });
 
   it('picks the largest whole unit', () => {
-    expect(timeUntil('2026-05-20T10:30:00.000Z', now)).toBe('30m');
-    expect(timeUntil('2026-05-20T15:00:00.000Z', now)).toBe('5h');
-    expect(timeUntil('2026-05-23T10:00:00.000Z', now)).toBe('3d');
+    expect(timeUntil('2026-05-20T10:30:00.000Z', now)).toBe('in 30 minutes');
+    expect(timeUntil('2026-05-20T15:00:00.000Z', now)).toBe('in 5 hours');
+    expect(timeUntil('2026-05-23T10:00:00.000Z', now)).toBe('in 3 days');
+  });
+
+  it('follows the active locale (#278)', () => {
+    expect(timeUntil('2026-05-23T10:00:00.000Z', now, 'fr')).toBe('dans 3 jours');
   });
 
   it('accepts a Date as the reference point', () => {
-    expect(timeUntil('2026-05-20T10:30:00.000Z', new Date(now))).toBe('30m');
+    expect(timeUntil('2026-05-20T10:30:00.000Z', new Date(now))).toBe('in 30 minutes');
   });
 
   afterEach(() => {
@@ -170,7 +205,45 @@ describe('timeUntil', () => {
   it('falls back to the wall clock when now is 0 or null', () => {
     vi.useFakeTimers();
     vi.setSystemTime(now);
-    expect(timeUntil('2026-05-20T11:00:00.000Z', 0)).toBe('1h');
-    expect(timeUntil('2026-05-20T11:00:00.000Z', null)).toBe('1h');
+    expect(timeUntil('2026-05-20T11:00:00.000Z', 0)).toBe('in 1 hour');
+    expect(timeUntil('2026-05-20T11:00:00.000Z', null)).toBe('in 1 hour');
+  });
+});
+
+describe('timeSince', () => {
+  const now = Date.parse('2026-05-20T10:00:00.000Z');
+
+  it('renders a dash with no date', () => {
+    expect(timeSince(null)).toBe('—');
+  });
+
+  it('returns "now" for the present or future', () => {
+    expect(timeSince('2026-05-20T10:00:00.000Z', now)).toBe('now');
+    expect(timeSince('2026-05-20T11:00:00.000Z', now)).toBe('now');
+  });
+
+  it('picks the largest whole unit', () => {
+    expect(timeSince('2026-05-20T09:30:00.000Z', now)).toBe('30 minutes ago');
+    expect(timeSince('2026-05-20T05:00:00.000Z', now)).toBe('5 hours ago');
+    expect(timeSince('2026-05-17T10:00:00.000Z', now)).toBe('3 days ago');
+  });
+
+  it('follows the active locale (#278)', () => {
+    expect(timeSince('2026-05-17T10:00:00.000Z', now, 'fr')).toBe('il y a 3 jours');
+  });
+
+  it('accepts a Date as the reference point', () => {
+    expect(timeSince('2026-05-20T09:30:00.000Z', new Date(now))).toBe('30 minutes ago');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('falls back to the wall clock when now is 0 or null', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    expect(timeSince('2026-05-20T09:00:00.000Z', 0)).toBe('1 hour ago');
+    expect(timeSince('2026-05-20T09:00:00.000Z', null)).toBe('1 hour ago');
   });
 });

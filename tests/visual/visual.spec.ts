@@ -1,6 +1,8 @@
 import { expect, test } from '@playwright/test';
 
 import { blockAnalytics } from '../analytics-guard';
+import { E2E_CONTRACTS } from '../e2e/contracts';
+import { FUNDER } from '../e2e/fixtures';
 import {
   blockRpc,
   CLINIC_ADDRESS,
@@ -8,6 +10,7 @@ import {
   mockApi,
   settle,
   VOUCHER_ID,
+  voucherDetail,
 } from './fixtures';
 
 /**
@@ -49,6 +52,36 @@ test('my vouchers — disconnected', async ({ page }) => {
   await expect(page).toHaveScreenshot('my.png');
 });
 
+test('my vouchers — selected refundable vouchers', async ({ page }) => {
+  await page.addInitScript(
+    `window.__SCI_MOCK_WALLET__ = { address: '${FUNDER}' };
+     window.__SCI_MOCK_RPC__ = { calls: [], args: [] };`,
+  );
+  const vouchers = ['1', '2'].map((id) => ({
+    ...voucherDetail,
+    id,
+    funder: FUNDER,
+    status: 'Funded',
+    isRefundable: true,
+  }));
+  await page.route(/^http:\/\/localhost:8080\/vouchers(?:\?.*)?$/, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ total: vouchers.length, vouchers }),
+    }),
+  );
+
+  await page.goto('/my');
+  const selectAll = page.getByRole('checkbox', {
+    name: 'Select all on this page (2)',
+  });
+  await expect(selectAll).toBeVisible();
+  await selectAll.check();
+  await settle(page);
+  await expect(page).toHaveScreenshot('my-selected-vouchers.png');
+});
+
 test('clinic desk — disconnected', async ({ page }) => {
   await page.goto('/clinic');
   await expect(page.getByText('Connect the clinic')).toBeVisible();
@@ -56,11 +89,63 @@ test('clinic desk — disconnected', async ({ page }) => {
   await expect(page).toHaveScreenshot('clinic-desk.png');
 });
 
+test('clinic desk — SEP-24 cash-out handoff', async ({ page }) => {
+  await page.addInitScript(
+    `window.__SCI_MOCK_WALLET__ = { address: '${CLINIC_ADDRESS}' };
+     window.__SCI_MOCK_RPC__ = { calls: [], args: [] };`,
+  );
+  await page.route('https://anchor.example/**', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/.well-known/stellar.toml') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'text/plain',
+        body: `NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"\nSIGNING_KEY = "GCSGSR6KQQ5BP2FXVPWRL6SWPUSFWLVONLIBJZUKTVQB5FYJFVL6XOXE"\nWEB_AUTH_ENDPOINT = "https://anchor.example/auth"\nTRANSFER_SERVER_SEP0024 = "https://anchor.example/sep24"\n\n[[CURRENCIES]]\ncode = "USDC"\nissuer = "${E2E_CONTRACTS.usdcIssuer}"`,
+      });
+    }
+    if (url.pathname === '/sep24/info') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ withdraw: { USDC: { enabled: true, min_amount: 1, max_amount: 100 } } }),
+      });
+    }
+    return route.fulfill({ status: 404, body: '{}' });
+  });
+
+  await page.goto('/clinic');
+  await expect(page.getByRole('heading', { name: 'Local cash-out' })).toBeVisible();
+  await page.getByLabel('Anchor').selectOption('anchor.example');
+  await expect(page.getByText('Anchor limits: 1–100 USDC.')).toBeVisible();
+  await expect(page.getByText(/may require identity verification \(KYC\)/)).toBeVisible();
+  await settle(page);
+  await expect(page.getByRole('region', { name: 'Local cash-out' })).toHaveScreenshot('clinic-cashout.png');
+});
+
 test('attest — disconnected', async ({ page }) => {
   await page.goto('/attest');
   await expect(page.getByText('Connect an attester')).toBeVisible();
   await settle(page);
   await expect(page).toHaveScreenshot('attest.png');
+});
+
+test('admin — verified operator console', async ({ page }) => {
+  await page.addInitScript(
+    `window.__SCI_MOCK_WALLET__ = { address: '${FUNDER}' };
+     window.__SCI_MOCK_RPC__ = {
+       calls: [], args: [], reads: {
+         '${E2E_CONTRACTS.registry}:get_admin': '${FUNDER}',
+         '${E2E_CONTRACTS.voucher}:get_config': { admin: '${FUNDER}' }
+       }
+     };`,
+  );
+  await page.goto('/admin');
+  await expect(page.getByRole('heading', { name: 'Admin console' })).toBeVisible();
+  await expect(page.getByText('Pending clinics')).toBeVisible();
+  await expect(page.getByText('Disputed vouchers')).toBeVisible();
+  await expect(page.getByText('Attesters', { exact: true }).first()).toBeVisible();
+  await settle(page);
+  await expect(page).toHaveScreenshot('admin.png');
 });
 
 test('voucher detail — history and receipt', async ({ page }) => {

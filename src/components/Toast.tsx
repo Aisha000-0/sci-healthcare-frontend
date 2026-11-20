@@ -98,6 +98,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     <ToastContext.Provider value={api}>
       {children}
       <div
+        // `role="status"` is what makes the region a live region to assistive
+        // technology; `aria-live` alone leaves some screen readers silent.
+        role="status"
         aria-live="polite"
         aria-atomic="false"
         aria-label="Notifications"
@@ -113,7 +116,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               type="button"
               onClick={() => dismiss(t.id)}
               aria-label="Dismiss notification"
-              className="-mr-1 -mt-1 flex-none rounded-md px-1.5 py-0.5 text-base leading-none opacity-60 transition hover:opacity-100"
+              className="-me-1 -mt-1 flex-none rounded-md px-1.5 py-0.5 text-base leading-none opacity-60 transition hover:opacity-100"
             >
               ×
             </button>
