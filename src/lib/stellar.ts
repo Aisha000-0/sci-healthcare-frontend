@@ -326,6 +326,14 @@ async function mockReadResult<T>(method: string, args: xdr.ScVal[]): Promise<T> 
       return { amount: 500000000n } as unknown as T;
     case 'balance':
       return 100000000n as unknown as T;
+    case 'get_admin':
+      return ((typeof window !== 'undefined' &&
+        (window as unknown as { __SCI_MOCK_ADMIN__?: string }).__SCI_MOCK_ADMIN__) ||
+        'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF') as unknown as T;
+    case 'get_pending_admin':
+      return ((typeof window !== 'undefined' &&
+        (window as unknown as { __SCI_MOCK_PENDING_ADMIN__?: string | null })
+          .__SCI_MOCK_PENDING_ADMIN__) ?? null) as unknown as T;
     default:
       throw new Error(`E2E mock has no canned read for ${method}`);
   }

@@ -24,6 +24,8 @@ declare global {
   interface Window {
     __SCI_MOCK_WALLET__?: { address: string };
     __SCI_MOCK_RPC__?: { calls: MockRpcCall[]; delayMs?: number };
+    __SCI_MOCK_ADMIN__?: string;
+    __SCI_MOCK_PENDING_ADMIN__?: string | null;
   }
 }
 

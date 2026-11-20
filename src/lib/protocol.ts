@@ -131,6 +131,51 @@ export const voucher = {
     const args = client.spec.funcArgsToScVals('quote', { amount });
     return readContract<[bigint, bigint]>(config.contracts.voucher, 'quote', args);
   },
+
+  /** Current administrator of the voucher contract. */
+  async getAdmin(): Promise<string> {
+    const client = getVoucherClient();
+    const args = client.spec.funcArgsToScVals('get_admin', {});
+    return readContract<string>(config.contracts.voucher, 'get_admin', args);
+  },
+
+  /** Nominated (pending) administrator, or null when no handover is in flight. */
+  async getPendingAdmin(): Promise<string | null> {
+    const client = getVoucherClient();
+    const args = client.spec.funcArgsToScVals('get_pending_admin', {});
+    return readContract<string | null>(config.contracts.voucher, 'get_pending_admin', args);
+  },
+
+  /** Propose a new administrator. Only the current admin may call. */
+  async proposeAdmin(admin: string, newAdmin: string, sign: SignFn) {
+    const client = getVoucherClient();
+    const args = client.spec.funcArgsToScVals('propose_admin', {
+      admin,
+      new_admin: newAdmin,
+    });
+    return invokeContract(
+      config.contracts.voucher,
+      'propose_admin',
+      args,
+      admin,
+      sign,
+    );
+  },
+
+  /** Accept a pending admin nomination. Only the nominee may call. */
+  async acceptAdmin(nominee: string, sign: SignFn) {
+    const client = getVoucherClient();
+    const args = client.spec.funcArgsToScVals('accept_admin', {
+      new_admin: nominee,
+    });
+    return invokeContract(
+      config.contracts.voucher,
+      'accept_admin',
+      args,
+      nominee,
+      sign,
+    );
+  },
 };
 
 /** ProviderStatus discriminants in the registry contract, in order. */
@@ -240,6 +285,51 @@ export const registry = {
       addr: address,
     });
     return readContract<boolean>(config.contracts.registry, 'is_attester', args);
+  },
+
+  /** Current administrator of the registry contract. */
+  async getAdmin(): Promise<string> {
+    const client = getRegistryClient();
+    const args = client.spec.funcArgsToScVals('get_admin', {});
+    return readContract<string>(config.contracts.registry, 'get_admin', args);
+  },
+
+  /** Nominated (pending) administrator, or null when no handover is in flight. */
+  async getPendingAdmin(): Promise<string | null> {
+    const client = getRegistryClient();
+    const args = client.spec.funcArgsToScVals('get_pending_admin', {});
+    return readContract<string | null>(config.contracts.registry, 'get_pending_admin', args);
+  },
+
+  /** Propose a new administrator. Only the current admin may call. */
+  async proposeAdmin(admin: string, newAdmin: string, sign: SignFn) {
+    const client = getRegistryClient();
+    const args = client.spec.funcArgsToScVals('propose_admin', {
+      admin,
+      new_admin: newAdmin,
+    });
+    return invokeContract(
+      config.contracts.registry,
+      'propose_admin',
+      args,
+      admin,
+      sign,
+    );
+  },
+
+  /** Accept a pending admin nomination. Only the nominee may call. */
+  async acceptAdmin(nominee: string, sign: SignFn) {
+    const client = getRegistryClient();
+    const args = client.spec.funcArgsToScVals('accept_admin', {
+      new_admin: nominee,
+    });
+    return invokeContract(
+      config.contracts.registry,
+      'accept_admin',
+      args,
+      nominee,
+      sign,
+    );
   },
 };
 
