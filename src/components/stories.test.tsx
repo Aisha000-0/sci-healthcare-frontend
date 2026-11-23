@@ -30,11 +30,47 @@ vi.mock('next/navigation', () => ({
  * do. `@storybook/addon-a11y` reports it in Storybook itself.
  */
 
+/**
+ * The stories render outside the Next.js app router, which pages have but a
+ * unit test does not. `DetailLink` asks it for `prefetch`, so without this
+ * mock every `VoucherRow` story throws before it renders anything.
+ */
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({
+    prefetch: () => {},
+    push: () => {},
+    replace: () => {},
+    back: () => {},
+  }),
+  usePathname: () => '/',
+  useSearchParams: () => new URLSearchParams(),
+}));
+
 // Every story file in this directory, so a new one is covered automatically.
 const storyModules = import.meta.glob('./*.stories.tsx', { eager: true }) as Record<
   string,
   Record<string, unknown>
 >;
+
+/**
+ * Stories render outside a Next app router, so `useRouter` and `usePathname`
+ * would throw here even though they are fine in Storybook, whose Next.js
+ * framework stubs the router. This is that same stub, so a component that
+ * links to another page — `DetailLink`, used by `VoucherRow` — renders.
+ */
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({
+    prefetch: () => {},
+    push: () => {},
+    replace: () => {},
+    back: () => {},
+    forward: () => {},
+    refresh: () => {},
+  }),
+  usePathname: () => '/',
+  useSearchParams: () => new URLSearchParams(),
+  useParams: () => ({}),
+}));
 
 type StoryComponent = React.ComponentType;
 
