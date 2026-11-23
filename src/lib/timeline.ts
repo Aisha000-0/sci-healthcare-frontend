@@ -1,5 +1,29 @@
-import type { Receipt, Voucher, VoucherEvent } from './api';
+import type { Receipt, Voucher, VoucherEvent, VoucherStatus } from './api';
 import { disputeReasonLabel } from './disputes';
+
+export type VoucherRole = 'funder' | 'clinic' | 'patient';
+
+export const VOUCHER_ROLES: readonly VoucherRole[] = [
+  'funder',
+  'clinic',
+  'patient',
+] as const;
+
+export const TIMELINE_STATUSES: readonly VoucherStatus[] = [
+  'Funded',
+  'Claimed',
+  'Attested',
+  'Settled',
+  'Disputed',
+  'Refunded',
+] as const;
+
+export function getStatusExplanationKey(
+  status: VoucherStatus,
+  role: VoucherRole,
+): string {
+  return `voucher.statusExplanation.${status}.${role}`;
+}
 
 export type StepState = 'done' | 'current' | 'upcoming' | 'skipped';
 
@@ -7,7 +31,7 @@ export type TimelineStep = {
   label: string;
   state: StepState;
   /** When it happened, or when it is due for upcoming steps. */
-  at: string | null;
+  at: string | Date | null;
   detail?: string;
   /**
    * Hash of the transaction behind this step, when the indexer has one

@@ -1,13 +1,26 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 
-import { formatDate, shortAddress } from '@/lib/amounts';
+import { formatDate, formatUsdc, shortAddress } from '@/lib/amounts';
+import type { Receipt } from '@/lib/api';
 import { beneficiaryRef } from '@/lib/beneficiary';
+import { humaniseError } from '@/lib/errors';
 import { useProviders, useReceipts } from '@/lib/hooks';
+import { receipt as receiptContract } from '@/lib/protocol';
+import { compareReceipt, type ReceiptMismatch } from '@/lib/receipt-verify';
 import { useSavedIdentity } from '@/lib/useSavedIdentity';
-import { Button, Card, Empty } from '@/components/ui';
+import { Alert, Button, Card, Empty } from '@/components/ui';
+import { SkeletonRow } from '@/components/Skeleton';
+import { useLocaleContext } from '@/i18n/LocaleContext';
+
+type VerifyState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'ok' }
+  | { status: 'mismatch'; mismatches: ReceiptMismatch[] }
+  | { status: 'error'; message: string };
 
 /**
  * Print-friendly summary of care delivered to a patient (#46).
@@ -17,9 +30,11 @@ import { Button, Card, Empty } from '@/components/ui';
  * patient reference, secret key, or beneficiary hash.
  */
 export default function PrintableCareSummaryPage() {
+  const { t, locale } = useLocaleContext();
   const saved = useSavedIdentity();
   const [activeRef, setActiveRef] = useState<string | null>(null);
   const [deriving, setDeriving] = useState(true);
+  const [verification, setVerification] = useState<Record<string, VerifyState>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -63,6 +78,49 @@ export default function PrintableCareSummaryPage() {
 
   const loading = deriving || receiptsLoading;
 
+  /**
+   * Reads the receipt from the receipt contract and compares it with the row
+   * on screen (#294). Simulation needs no wallet, so a reader can verify a
+   * printed summary without ever connecting one.
+   */
+  async function verify(receipt: Receipt) {
+    setVerification((previous) => ({
+      ...previous,
+      [receipt.voucherId]: { status: 'loading' },
+    }));
+    try {
+      const onChain = await receiptContract.get(receipt.voucherId);
+      const comparison = compareReceipt(receipt, onChain);
+      setVerification((previous) => ({
+        ...previous,
+        [receipt.voucherId]: comparison.ok
+          ? { status: 'ok' }
+          : { status: 'mismatch', mismatches: comparison.mismatches },
+      }));
+    } catch (err) {
+      setVerification((previous) => ({
+        ...previous,
+        [receipt.voucherId]: {
+          status: 'error',
+          message: humaniseError(err, undefined, locale),
+        },
+      }));
+    }
+  }
+
+  function fieldLabel(field: ReceiptMismatch['field']): string {
+    return t(`print.field.${field}`);
+  }
+
+  function fieldValue(field: ReceiptMismatch['field'], value: string): string {
+    if (field === 'amount') return `$${formatUsdc(value, locale)}`;
+    if (field === 'settledAt') {
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? value : formatDate(date, locale);
+    }
+    return value;
+  }
+
   return (
     <div className="space-y-6">
       {/* Print actions toolbar - hidden during printing */}
@@ -105,7 +163,11 @@ export default function PrintableCareSummaryPage() {
       </div>
 
       {loading && (
-        <p className="text-sm text-[var(--color-ink-soft)] print:hidden">Loading care history…</p>
+        <Card className="space-y-4 p-5 print:hidden">
+          <SkeletonRow />
+          <SkeletonRow />
+          <SkeletonRow />
+        </Card>
       )}
 
       {!loading && receipts.length === 0 && (
@@ -139,7 +201,7 @@ export default function PrintableCareSummaryPage() {
                 Stellar blockchain ledger.
               </p>
             </div>
-            <div className="text-left sm:text-right text-xs text-slate-500 space-y-1">
+            <div className="text-start sm:text-end text-xs text-slate-500 space-y-1">
               <div>
                 <span className="font-medium text-slate-700">Issued:</span>{' '}
                 {formatDate(new Date())}
@@ -157,23 +219,28 @@ export default function PrintableCareSummaryPage() {
 
           {/* Receipts Table */}
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm border-collapse">
+            <table className="w-full text-start text-sm border-collapse">
               <caption className="sr-only">Delivered patient care receipts</caption>
               <thead>
                 <tr className="border-b-2 border-slate-200 text-xs font-semibold uppercase tracking-wider text-slate-600">
-                  <th scope="col" className="py-3 pr-4">Date</th>
+                  <th scope="col" className="py-3 pe-4">Date</th>
                   <th scope="col" className="py-3 px-4">Clinic</th>
                   <th scope="col" className="py-3 px-4">Service</th>
-                  <th scope="col" className="py-3 px-4 text-right">Amount</th>
-                  <th scope="col" className="py-3 pl-4 text-right">Receipt #</th>
+                  <th scope="col" className="py-3 px-4 text-end">Amount</th>
+                  <th scope="col" className="py-3 ps-4 text-end">Receipt #</th>
+                  <th scope="col" className="py-3 ps-4 text-end">
+                    {t('print.verify')}
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {receipts.map((r) => {
                   const clinicName = providerMap.get(r.providerAddress) ?? shortAddress(r.providerAddress);
+                  const state = verification[r.voucherId] ?? { status: 'idle' as const };
                   return (
-                    <tr key={r.voucherId} className="hover:bg-slate-50/50">
-                      <td className="py-3.5 pr-4 text-xs font-medium text-slate-700 whitespace-nowrap">
+                    <Fragment key={r.voucherId}>
+                    <tr className="hover:bg-slate-50/50">
+                      <td className="py-3.5 pe-4 text-xs font-medium text-slate-700 whitespace-nowrap">
                         {formatDate(r.settledAt)}
                       </td>
                       <td className="py-3.5 px-4 font-medium text-slate-900">
@@ -182,27 +249,56 @@ export default function PrintableCareSummaryPage() {
                       <td className="py-3.5 px-4 text-slate-700">
                         {r.serviceLabel ?? `Service ${r.serviceCode}`}
                       </td>
-                      <td className="py-3.5 px-4 text-right font-mono font-medium text-slate-900 whitespace-nowrap">
+                      <td className="py-3.5 px-4 text-end font-mono font-medium text-slate-900 whitespace-nowrap">
                         ${r.amountDisplay}
                       </td>
-                      <td className="py-3.5 pl-4 text-right font-mono text-xs text-slate-500 whitespace-nowrap">
+                      <td className="py-3.5 ps-4 text-end font-mono text-xs text-slate-500 whitespace-nowrap">
                         #{r.voucherId}
                       </td>
+                      <td className="py-3.5 ps-4 text-end align-top">
+                        <VerifyReceipt
+                          state={state}
+                          onVerify={() => void verify(r)}
+                          t={t}
+                        />
+                      </td>
                     </tr>
+                    {state.status === 'mismatch' && (
+                      <tr>
+                        <td colSpan={6} className="pb-3">
+                          <Alert>
+                            <div className="font-semibold">{t('print.mismatch')}</div>
+                            <ul className="mt-1 space-y-0.5">
+                              {state.mismatches.map((m) => (
+                                <li key={m.field}>
+                                  {t('print.fieldMismatch', {
+                                    field: fieldLabel(m.field),
+                                    displayed: fieldValue(m.field, m.displayed),
+                                    onChain: fieldValue(m.field, m.onChain),
+                                  })}
+                                </li>
+                              ))}
+                            </ul>
+                          </Alert>
+                        </td>
+                      </tr>
+                    )}
+                    </Fragment>
                   );
                 })}
               </tbody>
               <tfoot>
                 <tr className="border-t-2 border-slate-200 font-semibold text-slate-900">
-                  <td colSpan={3} className="py-3.5 pr-4 text-xs uppercase tracking-wider">
+                  <td colSpan={3} className="py-3.5 pe-4 text-xs uppercase tracking-wider">
                     Total
                   </td>
-                  <td className="py-3.5 px-4 text-right font-mono text-base">
+                  <td className="py-3.5 px-4 text-end font-mono text-base">
                     ${spend}
                   </td>
-                  <td className="py-3.5 pl-4 text-right text-xs text-slate-500">
+                  <td className="py-3.5 ps-4 text-end text-xs text-slate-500">
                     USDC
                   </td>
+                  <td />
                 </tr>
               </tfoot>
             </table>
@@ -220,5 +316,48 @@ export default function PrintableCareSummaryPage() {
         </div>
       )}
     </div>
+  );
+}
+
+/** Per-row verify control; the mismatch detail is rendered under the row. */
+function VerifyReceipt({
+  state,
+  onVerify,
+  t,
+}: {
+  state: VerifyState;
+  onVerify: () => void;
+  t: (key: string, params?: Record<string, string | number>) => string;
+}) {
+  if (state.status === 'loading') {
+    return <span className="text-xs text-slate-500">{t('print.verifying')}</span>;
+  }
+  if (state.status === 'ok') {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700">
+        <span aria-hidden="true">✓</span> {t('print.verified')}
+      </span>
+    );
+  }
+  if (state.status === 'mismatch') {
+    return (
+      <span className="text-xs font-semibold text-[var(--color-danger)]">
+        {t('print.mismatchShort')}
+      </span>
+    );
+  }
+  if (state.status === 'error') {
+    return (
+      <span className="text-xs text-slate-500" title={state.message}>
+        {t('print.error')}
+      </span>
+    );
+  }
+  return (
+    <span className="print:hidden">
+      <Button variant="ghost" className="px-2.5 py-1 text-xs" onClick={onVerify}>
+        {t('print.verify')}
+      </Button>
+    </span>
   );
 }

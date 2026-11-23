@@ -2,14 +2,19 @@
 
 import dynamic from 'next/dynamic';
 import Link from 'next/link';
-import { useMemo, useState } from 'react';
+import { DetailLink } from '@/components/DetailLink';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { providerLocation, type Provider } from '@/lib/api';
 import { formatUsdc } from '@/lib/amounts';
+import { clinicCountries, filterClinics, parseCountry } from '@/lib/clinic-filters';
+import { useFavouriteClinics } from '@/lib/favourites';
 import { useLiveUpdates, useProviders, useStats } from '@/lib/hooks';
 import { useLowBandwidth } from '@/lib/low-bandwidth';
 import { DemoTour } from '@/components/DemoTour';
-import { Alert, Card, Empty } from '@/components/ui';
+import { Alert, Button, Card, Empty } from '@/components/ui';
+import { Skeleton, SkeletonCard } from '@/components/Skeleton';
+import { WidgetBoundary } from '@/components/WidgetBoundary';
 
 /**
  * Leaflet is loaded only when the map view is opened. `ssr: false` keeps
@@ -21,16 +26,71 @@ const ClinicMap = dynamic(
   {
     ssr: false,
     loading: () => (
-      <p className="text-sm text-[var(--color-ink-soft)]">Loading map…</p>
+      <Skeleton className="h-96 w-full rounded-xl" />
     ),
   },
 );
+
+/**
+ * Mounts the map only once its panel is close to the viewport (#339).
+ *
+ * Switching to the map view used to start the Leaflet chunk and the first
+ * tiles immediately, even when the panel sat below the fold, so on a slow
+ * connection they competed with the list the visitor came for. The panel now
+ * renders a placeholder of the map's own height and the observer swaps in the
+ * real map 200px before it scrolls into view, which keeps the layout stable
+ * and makes scrolling — not the toggle — the thing that triggers the load.
+ *
+ * Low-data mode never reaches this component: the page forces the list view
+ * below, so there is no tap-to-load path to add here.
+ */
+function DeferredClinicMap({ providers }: { providers: Provider[] }) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [nearViewport, setNearViewport] = useState(false);
+
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (!panel || nearViewport) return;
+    // Without IntersectionObserver, load on the next tick rather than never.
+    // Deferred so the fallback is not a synchronous state write in an effect,
+    // which React renders twice.
+    if (typeof IntersectionObserver === 'undefined') {
+      const timer = setTimeout(() => setNearViewport(true), 0);
+      return () => clearTimeout(timer);
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting))
+          setNearViewport(true);
+      },
+      { rootMargin: '200px 0px' },
+    );
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [nearViewport]);
+
+  return (
+    <div ref={panelRef}>
+      {nearViewport ? (
+        <ClinicMap providers={providers} />
+      ) : (
+        <div
+          className="relative flex h-80 w-full items-center justify-center overflow-hidden rounded-xl border border-[var(--color-line)] bg-[var(--color-canvas)] text-sm text-[var(--color-ink-soft)]"
+          role="status"
+        >
+          The map loads as you scroll to it.
+        </div>
+      )}
+    </div>
+  );
+}
 
 type View = 'list' | 'map';
 
 export default function HomePage() {
   const [view, setView] = useState<View>('list');
   const lowBandwidth = useLowBandwidth();
+  const favourites = useFavouriteClinics();
   useLiveUpdates();
 
   // The map is the heaviest thing on this page: a Leaflet chunk plus one
@@ -38,6 +98,27 @@ export default function HomePage() {
   // whatever the toggle says, so switching the mode on while the map is open
   // drops it immediately, and switching it back off restores the choice.
   const activeView: View = lowBandwidth ? 'list' : view;
+
+  // Search and country are view state, so they live in the URL — written with
+  // the History API rather than a Next navigation, as on /my, so the page keeps
+  // its prerendered HTML instead of moving behind a client-rendering boundary.
+  const [query, setQuery] = useState('');
+  // Two controls changed in quick succession would both build on the query
+  // from the render before the first write landed, so build every write on the
+  // last query we wrote instead.
+  const queryRef = useRef('');
+  useEffect(() => {
+    const sync = () => {
+      const next = window.location.search.replace(/^\?/, '');
+      queryRef.current = next;
+      setQuery(next);
+    };
+    sync();
+    window.addEventListener('popstate', sync);
+    return () => window.removeEventListener('popstate', sync);
+  }, []);
+
+  const searchParams = useMemo(() => new URLSearchParams(query), [query]);
 
   const {
     providers,
@@ -47,16 +128,64 @@ export default function HomePage() {
   const { stats, error: statsError } = useStats();
   const error = providersError || statsError;
 
+  // The country list is built from the clinics present, so it can never offer
+  // a filter that matches nothing.
+  const countries = useMemo(() => clinicCountries(providers), [providers]);
+  const searchTerm = searchParams.get('q') ?? '';
+  const countryFilter = parseCountry(searchParams.get('country'), countries);
+  const filtered = useMemo(
+    () => filterClinics(providers, { q: searchTerm, country: countryFilter }),
+    [providers, searchTerm, countryFilter],
+  );
+  const visible = useMemo(() => {
+    if (favourites.length === 0) return filtered;
+    return [...filtered].sort((a, b) => {
+      const aFav = favourites.includes(a.address);
+      const bFav = favourites.includes(b.address);
+      if (aFav === bFav) return 0;
+      return aFav ? -1 : 1;
+    });
+  }, [filtered, favourites]);
+  const filtering = searchTerm.trim().length > 0 || countryFilter !== null;
+
   // Memoized so the map is not torn down and rebuilt on every render: the
   // filter arrays are otherwise new objects each time.
   const { located, unlocated } = useMemo(() => {
     const withLocation: Provider[] = [];
     const withoutLocation: Provider[] = [];
-    for (const p of providers) {
+    for (const p of visible) {
       (providerLocation(p) ? withLocation : withoutLocation).push(p);
     }
     return { located: withLocation, unlocated: withoutLocation };
-  }, [providers]);
+  }, [visible]);
+
+  function writeParams(update: (params: URLSearchParams) => void) {
+    const params = new URLSearchParams(queryRef.current);
+    update(params);
+    const next = params.toString();
+    queryRef.current = next;
+    setQuery(next);
+    window.history.replaceState(
+      window.history.state,
+      '',
+      next ? `${window.location.pathname}?${next}` : window.location.pathname,
+    );
+  }
+
+  function setParam(key: 'q' | 'country', value: string) {
+    writeParams((params) => {
+      // Empty values are removed, so an unfiltered directory stays a clean link.
+      if (!value) params.delete(key);
+      else params.set(key, value);
+    });
+  }
+
+  function clearFilters() {
+    writeParams((params) => {
+      params.delete('q');
+      params.delete('country');
+    });
+  }
 
   return (
     <div className="space-y-6">
@@ -76,19 +205,19 @@ export default function HomePage() {
         <div className="flex flex-wrap items-center gap-2.5">
           <a
             href="#directory"
-            className="inline-flex items-center justify-center gap-2 rounded-lg bg-[var(--color-brand)] px-3.5 py-1.5 text-sm font-medium text-white transition hover:opacity-90"
+            className="inline-flex max-sm:min-h-11 items-center justify-center gap-2 rounded-lg bg-[var(--color-brand)] px-3.5 py-1.5 text-sm font-medium text-[var(--color-brand-text)] transition hover:opacity-90"
           >
             Browse clinics &darr;
           </a>
           <Link
             href="/how-it-works"
-            className="inline-flex items-center justify-center gap-2 rounded-lg border border-[var(--color-line)] bg-white px-3.5 py-1.5 text-sm font-medium text-[var(--color-ink)] transition hover:bg-[var(--color-canvas)]"
+            className="inline-flex max-sm:min-h-11 items-center justify-center gap-2 rounded-lg border border-[var(--color-line)] bg-[var(--color-surface)] px-3.5 py-1.5 text-sm font-medium text-[var(--color-ink)] transition hover:bg-[var(--color-canvas)]"
           >
             How it works &rarr;
           </Link>
           <Link
             href="/clinic"
-            className="inline-flex items-center justify-center gap-2 rounded-lg border border-[var(--color-line)] bg-white px-3.5 py-1.5 text-sm font-medium text-[var(--color-ink)] transition hover:bg-[var(--color-canvas)]"
+            className="inline-flex max-sm:min-h-11 items-center justify-center gap-2 rounded-lg border border-[var(--color-line)] bg-[var(--color-surface)] px-3.5 py-1.5 text-sm font-medium text-[var(--color-ink)] transition hover:bg-[var(--color-canvas)]"
           >
             Clinic desk
           </Link>
@@ -171,6 +300,34 @@ export default function HomePage() {
           </div>
         </div>
 
+        <div role="search" className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_12rem]">
+          <label className="block">
+            <span className="sr-only">Search clinics by name or service</span>
+            <input
+              type="search"
+              value={searchTerm}
+              onChange={(e) => setParam('q', e.target.value)}
+              placeholder="Search clinic name or service"
+              className="h-11 w-full rounded-lg border border-[var(--color-line)] bg-[var(--color-surface)] px-3 text-sm"
+            />
+          </label>
+          <label className="block">
+            <span className="sr-only">Filter by country</span>
+            <select
+              value={countryFilter ?? ''}
+              onChange={(e) => setParam('country', e.target.value)}
+              className="h-11 w-full rounded-lg border border-[var(--color-line)] bg-[var(--color-surface)] px-3 text-sm"
+            >
+              <option value="">All countries</option>
+              {countries.map((country) => (
+                <option key={country} value={country}>
+                  {country}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
         {lowBandwidth && (
           <p className="text-xs text-[var(--color-ink-soft)]">
             Low-data mode is on: the map and its tiles are skipped. Turn it off
@@ -178,9 +335,19 @@ export default function HomePage() {
           </p>
         )}
 
+        {filtering && !loading && !error && providers.length > 0 && (
+          <p className="text-xs text-[var(--color-ink-soft)]">
+            Showing {visible.length} of {providers.length} clinics
+            {countryFilter ? ` in ${countryFilter}` : ''}.
+          </p>
+        )}
+
         {error && <Alert>{error}</Alert>}
         {loading && !error && (
-          <p className="text-sm text-[var(--color-ink-soft)]">Loading clinics…</p>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <SkeletonCard />
+            <SkeletonCard />
+          </div>
         )}
 
         {!loading && !error && providers.length === 0 && (
@@ -190,18 +357,31 @@ export default function HomePage() {
           </Empty>
         )}
 
-        {activeView === 'list' && (
+        {!loading && !error && providers.length > 0 && visible.length === 0 && (
+          <Empty>
+            <p>No clinics match your search.</p>
+            <Button variant="ghost" className="mt-3" onClick={clearFilters}>
+              Clear search and filters
+            </Button>
+          </Empty>
+        )}
+
+        {activeView === 'list' && visible.length > 0 && (
           <div className="grid gap-3 sm:grid-cols-2">
-            {providers.map((p) => (
+            {visible.map((p) => (
               <ClinicCard key={p.address} provider={p} />
             ))}
           </div>
         )}
 
-        {activeView === 'map' && providers.length > 0 && (
+        {activeView === 'map' && visible.length > 0 && (
           <div className="space-y-3">
             {located.length > 0 ? (
-              <ClinicMap providers={located} />
+              // A failing map (or its chunk) must not take the directory
+              // down with it; the unlocated list below still renders.
+              <WidgetBoundary label="The map">
+                <DeferredClinicMap providers={located} />
+              </WidgetBoundary>
             ) : (
               <Empty>No clinic has published a location yet.</Empty>
             )}
@@ -214,15 +394,15 @@ export default function HomePage() {
                 <ul className="divide-y divide-[var(--color-line)] rounded-xl border border-[var(--color-line)] bg-[var(--color-surface)]">
                   {unlocated.map((p) => (
                     <li key={p.address}>
-                      <Link
-                        href={`/clinics/${p.address}`}
-                        className="flex items-center justify-between gap-3 px-4 py-3 text-sm transition hover:bg-[var(--color-canvas)]"
+                      <DetailLink
+                        detail={{ kind: 'clinic', id: p.address }}
+                        className="flex min-h-11 items-center justify-between gap-3 px-4 py-3 text-sm transition hover:bg-[var(--color-canvas)]"
                       >
                         <span>{p.name}</span>
                         <span className="text-xs text-[var(--color-ink-soft)]">
                           {p.country}
                         </span>
-                      </Link>
+                      </DetailLink>
                     </li>
                   ))}
                 </ul>
@@ -255,9 +435,9 @@ function ViewToggle({
       onClick={onClick}
       disabled={disabled}
       title={disabled ? disabledReason : undefined}
-      className={`rounded-md px-3 py-1 text-sm font-medium transition ${
+      className={`rounded-md px-3 py-1 text-sm font-medium transition max-sm:min-h-11 max-sm:px-4 ${
         active
-          ? 'bg-[var(--color-brand)] text-white'
+          ? 'bg-[var(--color-brand)] text-[var(--color-brand-text)]'
           : 'text-[var(--color-ink-soft)] hover:text-[var(--color-ink)]'
       } disabled:cursor-not-allowed disabled:opacity-40`}
     >
@@ -268,25 +448,25 @@ function ViewToggle({
 
 function ClinicCard({ provider: p }: { provider: Provider }) {
   return (
-    <Link href={`/clinics/${p.address}`}>
-      <Card className="h-full p-5 transition hover:border-[var(--color-brand)]">
+    <DetailLink detail={{ kind: 'clinic', id: p.address }}>
+      <Card className="h-full p-4 transition hover:border-[var(--color-brand)] sm:p-5">
         <div className="flex items-start justify-between gap-3">
-          <div>
-            <h3 className="font-medium">{p.name}</h3>
+          <div className="min-w-0">
+            <h3 className="break-words font-medium">{p.name}</h3>
             <p className="mt-0.5 text-xs text-[var(--color-ink-soft)]">
               {p.country}
             </p>
           </div>
-          <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 ring-1 ring-inset ring-emerald-200">
+          <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 ring-1 ring-inset ring-emerald-200">
             Verified
           </span>
         </div>
 
         <ul className="mt-4 space-y-1.5">
           {p.services.slice(0, 3).map((s) => (
-            <li key={s.code} className="flex justify-between text-sm">
-              <span className="text-[var(--color-ink-soft)]">{s.label}</span>
-              <span className="mono">${formatUsdc(s.price)}</span>
+            <li key={s.code} className="flex justify-between gap-3 text-sm">
+              <span className="min-w-0 break-words text-[var(--color-ink-soft)]">{s.label}</span>
+              <span className="mono shrink-0">${formatUsdc(s.price)}</span>
             </li>
           ))}
           {p.services.length === 0 && (
@@ -296,7 +476,7 @@ function ClinicCard({ provider: p }: { provider: Provider }) {
           )}
         </ul>
       </Card>
-    </Link>
+    </DetailLink>
   );
 }
 
