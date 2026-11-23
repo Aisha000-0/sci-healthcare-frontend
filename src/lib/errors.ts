@@ -48,6 +48,132 @@ export const FAUCET_ERRORS: Record<number, string> = {
   5: 'You have already had test USDC today. Try again later.',
 };
 
+export const VOUCHER_ERRORS_I18N: Record<string, Record<number, string>> = {
+  en: VOUCHER_ERRORS,
+  fr: {
+    1: 'Ce contrat a déjà été configuré.',
+    2: "Ce contrat n'a pas encore été configuré.",
+    3: "Vous n'êtes pas autorisé à faire cela.",
+    4: "Ce bon d'achat n'existe pas.",
+    5: "Cette clinique n'est pas active actuellement.",
+    6: 'Cette clinique ne propose pas ce service.',
+    7: 'Le montant est inférieur au prix affiché pour ce service.',
+    8: 'Le montant doit être supérieur à zéro.',
+    9: "La date d'expiration doit être dans le futur.",
+    10: "Ce bon d'achat n'est pas dans le bon état pour cette action.",
+    11: "Ce bon d'achat a expiré.",
+    12: "Ce bon d'achat ne peut pas encore être remboursé.",
+    13: 'La période de contestation est toujours ouverte. Le règlement se débloquera à sa clôture.',
+    14: 'La période de contestation est clôturée.',
+    15: 'Ces frais ne sont pas autorisés.',
+    16: 'Le calcul a dépassé la capacité.',
+    17: "Aucun transfert d'administration n'est en attente.",
+  },
+  sw: {
+    1: 'Mkataba huu tayari umewekwa.',
+    2: 'Mkataba huu bado haujawekwa.',
+    3: 'Huna mamlaka ya kufanya hivyo.',
+    4: 'Vocha hiyo haipo.',
+    5: 'Kliniki hii haifanyi kazi kwa sasa.',
+    6: 'Kliniki hii haitoi huduma hiyo.',
+    7: 'Kiasi kiko chini ya bei iliyoorodheshwa kwa huduma hii.',
+    8: 'Kiasi lazima kiwe zaidi ya sifuri.',
+    9: 'Tarehe ya mwisho wa matumizi lazima iwe siku zijazo.',
+    10: 'Vocha hii haiko katika hali sahihi ya hatua hiyo.',
+    11: 'Vocha hii imeisha muda wake.',
+    12: 'Vocha hii haiwezi kurejeshwa bado.',
+    13: 'Muda wa mzozo bado uko wazi. Malipo hufunguka mara tu unapofungwa.',
+    14: 'Muda wa mzozo umefungwa.',
+    15: 'Ada hiyo hairuhusiwi.',
+    16: 'Hesabu imezidi uwezo.',
+    17: 'Hakuna makabidhiano ya usimamizi yanayosubiriwa.',
+  },
+  yo: {
+    1: 'A ti ṣètò àdéhùn yìí tẹ́lẹ̀.',
+    2: 'A kò ì tíì ṣètò àdéhùn yìí.',
+    3: 'O kò ní àṣẹ láti ṣe bẹ́ẹ̀.',
+    4: 'Vóṣà yẹn kò sí.',
+    5: 'Kílíníkì yìí kò ṣiṣẹ́ báyìí.',
+    6: 'Kílíníkì yìí kò pèsè iṣẹ́ yẹn.',
+    7: 'Iye náà kéré ju iye tí a tò fún iṣẹ́ yìí.',
+    8: 'Iye náà gbọ́dọ̀ ju òdo.',
+    9: 'Ọjọ́ parí gbọ́dọ̀ wà ní ọjọ́ iwájú.',
+    10: 'Vóṣà yìí kò sí ní ipò tó yẹ fún ìgbésẹ̀ yẹn.',
+    11: 'Vóṣà yìí ti parí.',
+    12: 'A kò lè da owó vóṣà yìí padà báyìí.',
+    13: 'Àkókò àríyànjiyàn ṣì ṣí. Ìsanwó yóò ṣí ní kété tí ó bá parí.',
+    14: 'Àkókò àríyànjiyàn ti parí.',
+    15: 'A kò gba owó ìsan yẹn.',
+    16: 'Ìṣirò náà kọjá ààlà.',
+    17: 'Kò sí ìfipáṣẹ́ alábòójútó tó ń dúró.',
+  },
+};
+
+export const REGISTRY_ERRORS_I18N: Record<string, Record<number, string>> = {
+  en: REGISTRY_ERRORS,
+  fr: {
+    1: 'Ce registre a déjà été configuré.',
+    2: "Ce registre n'a pas encore été configuré.",
+    3: "Vous n'êtes pas autorisé à faire cela.",
+    4: "Cette clinique n'est pas enregistrée.",
+    5: 'Cette clinique est déjà enregistrée.',
+    6: "Cette clinique n'est pas encore active.",
+    7: "Ce service n'est pas répertorié.",
+    8: 'Le prix doit être supérieur à zéro.',
+    9: 'Le code pays doit comporter deux lettres.',
+    10: 'Un nom est requis.',
+    11: "Aucun transfert d'administration n'est en attente.",
+  },
+  sw: {
+    1: 'Rejesta hii tayari imewekwa.',
+    2: 'Rejesta hii bado haijawekwa.',
+    3: 'Huna mamlaka ya kufanya hivyo.',
+    4: 'Kliniki hiyo haijasajiliwa.',
+    5: 'Kliniki hiyo tayari imesajiliwa.',
+    6: 'Kliniki hii bado haifanyi kazi.',
+    7: 'Huduma hiyo haijaorodheshwa.',
+    8: 'Bei lazima iwe zaidi ya sifuri.',
+    9: 'Msimbo wa nchi lazima uwe na herufi mbili.',
+    10: 'Jina linahitajika.',
+    11: 'Hakuna makabidhiano ya usimamizi yanayosubiriwa.',
+  },
+  yo: {
+    1: 'A ti ṣètò ìforúkọsílẹ̀ yìí tẹ́lẹ̀.',
+    2: 'A kò ì tíì ṣètò ìforúkọsílẹ̀ yìí.',
+    3: 'O kò ní àṣẹ láti ṣe bẹ́ẹ̀.',
+    4: 'Kílíníkì yẹn kò forúkọsílẹ̀.',
+    5: 'Kílíníkì yẹn ti forúkọsílẹ̀ tẹ́lẹ̀.',
+    6: 'Kílíníkì yìí kò ì tíì ṣiṣẹ́.',
+    7: 'Iṣẹ́ yẹn kò wà lórí àkójọ.',
+    8: 'Iye gbọ́dọ̀ ju òdo.',
+    9: 'Kóòdù orílẹ̀-èdè gbọ́dọ̀ jẹ́ lẹ́tà méjì.',
+    10: 'Orúkọ ni a nílò.',
+    11: 'Kò sí ìfipáṣẹ́ alábòójútó tó ń dúró.',
+  },
+};
+
+export const FAUCET_ERRORS_I18N: Record<string, Record<number, string>> = {
+  en: FAUCET_ERRORS,
+  fr: {
+    2: "Le robinet USDC de test n'est pas configuré sur ce réseau.",
+    3: "Vous n'êtes pas autorisé à faire cela.",
+    4: 'Le montant du robinet doit être supérieur à zéro.',
+    5: "Vous avez déjà reçu des USDC de test aujourd'hui. Réessayez plus tard.",
+  },
+  sw: {
+    2: 'Bomba la majaribio la USDC halijawekwa kwenye mtandao huu.',
+    3: 'Huna mamlaka ya kufanya hivyo.',
+    4: 'Kiasi cha bomba lazima kiwe zaidi ya sifuri.',
+    5: 'Tayari umepokea USDC ya majaribio leo. Jaribu tena baadaye.',
+  },
+  yo: {
+    2: 'A kò ṣètò bọ́mbù USDC ìdánwò lórí nẹ́tíwọ́kì yìí.',
+    3: 'O kò ní àṣẹ láti ṣe bẹ́ẹ̀.',
+    4: 'Iye bọ́mbù gbọ́dọ̀ ju òdo.',
+    5: 'O ti gba USDC ìdánwò lónìí. Gbìyànjú lẹ́yìn.',
+  },
+};
+
 /** Pulls `Error(Contract, #N)` out of a Soroban host error string. */
 export function contractErrorCode(message: string): number | null {
   const m = /Error\(Contract,\s*#(\d+)\)/.exec(message);
@@ -57,6 +183,7 @@ export function contractErrorCode(message: string): number | null {
 export function humaniseError(
   err: unknown,
   table: Record<number, string> = VOUCHER_ERRORS,
+  locale = 'en',
 ): string {
   const message = err instanceof Error ? err.message : String(err);
   // Token failures surface through our contracts with the token's own error
@@ -64,17 +191,91 @@ export function humaniseError(
   // something else entirely), so recognise them by text before looking the
   // number up.
   if (/trustline/i.test(message)) {
+    if (locale === 'fr') return 'Votre portefeuille nécessite une trustline USDC pour détenir ou envoyer des USDC.';
+    if (locale === 'sw') return 'Pochi yako inahitaji trustline ya USDC kabla ya kupokea au kutuma USDC.';
+    if (locale === 'yo') return 'Àpò rẹ nílò trustline USDC kí ó tó lè gba tàbí fi USDC ránṣẹ́.';
     return 'Your wallet needs a USDC trustline before it can hold or send USDC.';
   }
   if (/insufficient balance|balance is not sufficient|underflow/i.test(message)) {
+    if (locale === 'fr') return 'Solde USDC insuffisant dans votre portefeuille.';
+    if (locale === 'sw') return 'Huna USDC ya kutosha kwenye pochi yako kwa hili.';
+    if (locale === 'yo') return 'Kò sí USDC tó tó nínú àpò rẹ fún èyí.';
     return 'Not enough USDC in your wallet for this.';
   }
   const code = contractErrorCode(message);
-  if (code !== null) return table[code] ?? `Contract rejected this (error #${code}).`;
+  if (code !== null) {
+    let resolvedTable = table;
+    if (table === VOUCHER_ERRORS && VOUCHER_ERRORS_I18N[locale]) {
+      resolvedTable = VOUCHER_ERRORS_I18N[locale];
+    } else if (table === REGISTRY_ERRORS && REGISTRY_ERRORS_I18N[locale]) {
+      resolvedTable = REGISTRY_ERRORS_I18N[locale];
+    } else if (table === FAUCET_ERRORS && FAUCET_ERRORS_I18N[locale]) {
+      resolvedTable = FAUCET_ERRORS_I18N[locale];
+    }
+    const mapped = resolvedTable[code] ?? table[code];
+    if (mapped) return mapped;
+    if (locale === 'fr') return `Le contrat a rejeté cette opération (erreur #${code}).`;
+    if (locale === 'sw') return `Mkataba umekataa ombi hili (hitilafu #${code}).`;
+    if (locale === 'yo') return `Àdéhùn kọ̀ ọ́ (àṣìṣe #${code}).`;
+    return `Contract rejected this (error #${code}).`;
+  }
   if (/account not found/i.test(message)) {
-    return config.network === 'testnet'
-      ? 'This account does not exist on the network yet. Fund it with Friendbot first.'
-      : 'This account does not exist on the network yet. Fund it first.';
+    if (config.network === 'testnet') {
+      if (locale === 'fr') return "Ce compte n'existe pas encore sur le réseau. Approvisionnez-le d'abord avec Friendbot.";
+      if (locale === 'sw') return 'Akaunti hii haipo kwenye mtandao bado. Iwekee fedha kwa Friendbot kwanza.';
+      if (locale === 'yo') return 'Àkọ́ọ̀lù yìí kò ì tíì sí lórí nẹ́tíwọ́kì. Kọ́kọ́ fi Friendbot gbé owó lé e.';
+      return 'This account does not exist on the network yet. Fund it with Friendbot first.';
+    }
+    if (locale === 'fr') return "Ce compte n'existe pas encore sur le réseau. Approvisionnez-le d'abord.";
+    if (locale === 'sw') return 'Akaunti hii haipo kwenye mtandao bado. Iwekee fedha kwanza.';
+    if (locale === 'yo') return 'Àkọ́ọ̀lù yìí kò ì tíì sí lórí nẹ́tíwọ́kì. Kọ́kọ́ gbé owó lé e.';
+    return 'This account does not exist on the network yet. Fund it first.';
   }
   return message;
+}
+
+/**
+ * Horizon result codes for a rejected *classic* transaction (the USDC
+ * changeTrust of #1 goes to Horizon, not through a contract, so these codes
+ * are the only explanation the user would otherwise get).
+ */
+const HORIZON_TX_ERRORS: Record<string, string> = {
+  tx_bad_seq:
+    'Your wallet signed an outdated version of this request. Press Add USDC again.',
+  tx_insufficient_fee: 'The network fee was too low. Press Add USDC again.',
+  tx_failed: 'The network rejected this request. Press Add USDC again.',
+  op_underfunded:
+    'Not enough XLM: holding USDC locks 0.5 XLM as a reserve. Top up your ' +
+    'wallet, then press Add USDC again.',
+  op_line_full:
+    'Your wallet already holds all the USDC this issuer allows.',
+  op_no_issuer: 'USDC does not exist on this network.',
+  op_no_trust:
+    'Your wallet is not ready to hold USDC yet. Press Add USDC and approve ' +
+    'it in your wallet.',
+  op_malformed: 'The request was built incorrectly. Press Add USDC again.',
+};
+
+/**
+ * Plain language for Horizon's `extras.result_codes` (`tx` plus one code
+ * per operation). Unknown codes are shown verbatim rather than swallowed:
+ * a recognisable code is still a starting point for a bug report.
+ */
+export function humaniseHorizonResult(
+  status: number,
+  codes?: { tx?: string; operations?: string[] } | null,
+): string {
+  const all = [...(codes?.operations ?? []), ...(codes?.tx ? [codes.tx] : [])];
+  for (const code of all) {
+    const message = HORIZON_TX_ERRORS[code];
+    if (message) return message;
+  }
+  if (all.length > 0) {
+    return `The network rejected this request (${all.join(', ')}). Try again.`;
+  }
+  if (status === 504) {
+    return 'The network is taking longer than usual. The request may still ' +
+      'go through — check your wallet balance before trying again.';
+  }
+  return `The Stellar network could not accept this request (HTTP ${status}). Try again.`;
 }

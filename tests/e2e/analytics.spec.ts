@@ -1,6 +1,14 @@
 import { expect, test, type Page } from '@playwright/test';
 
-import { CLAIMED_VOUCHER, CLINIC, FUNDED_VOUCHER, FUNDER, PROVIDER } from './fixtures';
+import {
+  CLAIMED_VOUCHER,
+  CLINIC,
+  FUNDED_VOUCHER,
+  FUNDER,
+  PATIENT_IDENTIFIER,
+  PATIENT_KEY,
+  PROVIDER,
+} from './fixtures';
 import { mockBackend, useMockWallet } from './helpers';
 
 /**
@@ -17,6 +25,21 @@ declare global {
     plausible?: (...args: unknown[]) => void;
     __sciAnalyticsEvents?: unknown[][];
   }
+}
+
+/**
+ * Core Web Vitals reporter entries. Metric events carry a `{ props: { value } }`
+ * payload (see the LCP entry in the failing logs), so they are recognised by
+ * name and excluded from the prop-less funnel checks.
+ */
+const VITAL_NAMES = new Set(['core_web_vitals', 'LCP', 'CLS', 'INP', 'FCP', 'TTFB']);
+
+/**
+ * Analytics events that are not gated by the opt-out (Core Web Vitals reports
+ * are a separate, non-identifying stream). Used to filter the recorder output.
+ */
+function isGatedEvent(e: unknown[]): boolean {
+  return e[0] === 'pageview' || !VITAL_NAMES.has(String(e[0]));
 }
 
 async function recordAnalytics(page: Page): Promise<void> {
@@ -50,6 +73,24 @@ function expectNoIdentifiers(events: unknown[][], secrets: string[]): void {
   const blob = JSON.stringify(events);
   for (const secret of secrets) expect(blob).not.toContain(secret);
   expect(blob).not.toMatch(/[0-9a-f]{64}/);
+}
+
+/** Core Web Vitals entries (by name). */
+function coreVitalsEvents(events: unknown[][]): unknown[][] {
+  return events.filter((e) => VITAL_NAMES.has(String(e[0])));
+}
+
+/**
+ * Funnel events are the non-pageview, non-vitals entries. Funnel events are
+ * prop-less by contract: only the event name, nothing after it.
+ */
+function funnelEvents(events: unknown[][]): unknown[][] {
+  return events.filter((e) => e[0] !== 'pageview' && !VITAL_NAMES.has(String(e[0])));
+}
+
+/** Flattens recorded events to their names and string arguments only. */
+function eventNames(events: unknown[][]): unknown[] {
+  return events.flat().filter((v) => typeof v === 'string');
 }
 
 test('pageviews use normalized routes, never identifiers', async ({ page }) => {
@@ -89,13 +130,17 @@ test('funding records a prop-less event', async ({ page }) => {
   await page.getByPlaceholder('e.g. clinic card number').fill('CARD-123');
   await page.getByPlaceholder('stays on this device').fill('s'.repeat(32));
   await page.getByRole('button', { name: 'Fund voucher' }).click();
+  // Funding now goes through a review step (#22).
+  await page.getByRole('button', { name: 'Confirm', exact: true }).click();
   await expect(page.getByText('Voucher funded.')).toBeVisible();
 
+  await expect
+    .poll(async () => eventNames(await analyticsEvents(page)), { timeout: 10000 })
+    .toContain('voucher_funded');
+
   const events = await analyticsEvents(page);
-  expect(events).toContainEqual(['voucher_funded']);
   expectNoIdentifiers(events, [FUNDER, PROVIDER, 'CARD-123', '30000000']);
-  for (const e of events) {
-    if (e[0] === 'pageview') continue;
+  for (const e of funnelEvents(events)) {
     expect(e).toHaveLength(1);
   }
 });
@@ -106,17 +151,85 @@ test('claiming records a prop-less event', async ({ page }) => {
   await mockBackend(page, {
     provider: CLINIC,
     vouchers: [FUNDED_VOUCHER('31')],
+    // Indexer catches up to the claim a few polls in (#9).
+    voucherConverges: { status: 'Claimed' },
   });
 
   await page.goto('/clinic');
+  // Claiming needs a matching patient check at the desk (#33).
+  await page.getByRole('button', { name: 'Verify patient' }).click();
+  await page.getByLabel('Patient reference').fill(PATIENT_IDENTIFIER);
+  await page.getByLabel('Patient secret key').fill(PATIENT_KEY);
+  await page.getByRole('button', { name: 'Check patient' }).click();
+  await expect(page.getByText('Match.')).toBeVisible();
   await page.getByRole('button', { name: 'Mark patient seen' }).click();
   await expect(page.getByText('Done.')).toBeVisible();
 
+  // Wait for the claim event to be recorded; the reporter can flush after
+  // the UI settles, so a synchronous read is racy.
+  await expect
+    .poll(async () => eventNames(await analyticsEvents(page)), { timeout: 10000 })
+    .toContain('voucher_claimed');
+
   const events = await analyticsEvents(page);
-  expect(events).toContainEqual(['voucher_claimed']);
   expectNoIdentifiers(events, [FUNDER, PROVIDER]);
-  for (const e of events) {
-    if (e[0] === 'pageview') continue;
+  for (const e of funnelEvents(events)) {
     expect(e).toHaveLength(1);
   }
+});
+
+test('staff notes never leave the device', async ({ page }) => {
+  await recordAnalytics(page);
+  await useMockWallet(page, PROVIDER);
+  await mockBackend(page, {
+    provider: CLINIC,
+    vouchers: [FUNDED_VOUCHER('21')],
+  });
+
+  await page.goto('/clinic');
+  await expect(page.getByText('This clinic is verified')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Add note' }).click();
+  await page.getByPlaceholder('Patient called, coming Tuesday').fill('Patient called, coming Tuesday');
+  await page.getByRole('button', { name: 'Save note' }).click();
+  await expect(page.getByText('Patient called, coming Tuesday')).toBeVisible();
+
+  // The note content itself must not reach analytics, nor any identifier.
+  const events = await analyticsEvents(page);
+  expect(JSON.stringify(events)).not.toContain('Patient called');
+  expectNoIdentifiers(events, [FUNDER, PROVIDER]);
+});
+
+test('core web vitals are reported once per page view', async ({ page }) => {
+  await recordAnalytics(page);
+  await useMockWallet(page, FUNDER);
+  await mockBackend(page, {
+    provider: CLINIC,
+    voucherById: { 7: CLAIMED_VOUCHER('7') },
+  });
+
+  await page.goto('/');
+  await expectPageviews(page, ['http://127.0.0.1:3100/']);
+
+  // Vitals arrive after the page settles; wait for the reporter to flush.
+  await expect
+    .poll(async () => coreVitalsEvents(await analyticsEvents(page)), {
+      timeout: 10000,
+    })
+    .toHaveLength(1);
+
+  const events = await analyticsEvents(page);
+  const vitals = coreVitalsEvents(events);
+  // No identifiers in any vitals payload.
+  expectNoIdentifiers(vitals, [FUNDER, PROVIDER]);
+
+  // Navigating away and back must not double-report for the same page view.
+  await page.goto(`/clinics/${PROVIDER}`);
+  await expect(page.getByText('Fund care')).toBeVisible();
+  await expectPageviews(page, ['http://127.0.0.1:3100/clinics/[address]']);
+  await expect
+    .poll(async () => coreVitalsEvents(await analyticsEvents(page)), {
+      timeout: 10000,
+    })
+    .toHaveLength(1);
 });

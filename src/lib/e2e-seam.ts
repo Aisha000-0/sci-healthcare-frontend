@@ -15,7 +15,7 @@
  */
 
 export type MockRpcCall = {
-  kind: 'invoke' | 'read';
+  kind: 'invoke' | 'read' | 'simulate' | 'change_trust';
   contractId: string;
   method: string;
 };
@@ -42,8 +42,16 @@ export function isMockRpc(): boolean {
   return typeof window !== 'undefined' && Boolean(window.__SCI_MOCK_RPC__);
 }
 
-export function recordMockCall(call: MockRpcCall): void {
-  window.__SCI_MOCK_RPC__?.calls.push(call);
+export function recordMockCall(call: MockRpcCall, args: string[] = []): void {
+  const mock = window.__SCI_MOCK_RPC__;
+  if (!mock) return;
+  mock.calls.push(call);
+  mock.args.push(args);
+}
+
+/** True once Playwright has made the mock wallet refuse to sign (#1). */
+export function mockSignRejects(): boolean {
+  return typeof window !== 'undefined' && Boolean(window.__SCI_MOCK_SIGN_REJECT__);
 }
 
 /**
@@ -54,4 +62,18 @@ export function mockRpcDelayMs(): number {
   if (typeof window === 'undefined') return 0;
   const delay = window.__SCI_MOCK_RPC__?.delayMs ?? 0;
   return Number.isFinite(delay) && delay > 0 ? delay : 0;
+}
+
+export function mockRpcRead(contractId: string, method: string): unknown {
+  return window.__SCI_MOCK_RPC__?.reads?.[`${contractId}:${method}`];
+}
+
+/**
+ * The mock SEP-7 submission, or null while the "wallet" has not submitted.
+ * Set by a Playwright test with `page.evaluate`.
+ */
+export function mockSep7Submission(): { hash: string } | null {
+  if (typeof window === 'undefined') return null;
+  const value = window.__SCI_MOCK_SEP7__;
+  return value?.hash ? { hash: value.hash } : null;
 }

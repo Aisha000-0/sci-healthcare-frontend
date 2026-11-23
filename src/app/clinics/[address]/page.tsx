@@ -1,30 +1,61 @@
 'use client';
 
-import Link from 'next/link';
+import { StrKey } from '@stellar/stellar-sdk';
+import { BASE_FEE } from '@stellar/stellar-sdk';
+import { DetailLink } from '@/components/DetailLink';
 import { use, useEffect, useMemo, useState } from 'react';
 
-import { type Service } from '@/lib/api';
+import { notFound, useSearchParams } from 'next/navigation';
+
+import { ApiError, type Service } from '@/lib/api';
 import {
   formatDate,
   formatUsdc,
+  formatXlm,
   toAmountInput,
   toBaseUnits,
+  validateAmountInput,
 } from '@/lib/amounts';
 import { trackEvent } from '@/lib/analytics';
 import { beneficiaryRef, generateKey, localIdentity } from '@/lib/beneficiary';
-import { invalidateVouchers, useProvider, useVouchers } from '@/lib/hooks';
+import {
+  invalidateVouchers,
+  useProvider,
+  useUsdcTrustline,
+  useVouchers,
+} from '@/lib/hooks';
 import { useSavedIdentity } from '@/lib/useSavedIdentity';
-import { config, explorerTx } from '@/lib/config';
+import {
+  saveCheckoutDraft,
+  loadCheckoutDraft,
+  clearCheckoutDraft,
+  type CheckoutDraft,
+} from '@/lib/checkout-draft';
+import { config, explorerTx, isTestnet } from '@/lib/config';
 import { humaniseError, VOUCHER_ERRORS } from '@/lib/errors';
-import { voucher } from '@/lib/protocol';
+import {
+  EXPIRY_OPTIONS,
+  expiresAtFor,
+  minExpiryDate,
+  type ExpiryChoice,
+} from '@/lib/expiry';
+import { usdc, voucher } from '@/lib/protocol';
+import { quoteXlmForUsdc, type RestoreFootprintSignContext } from '@/lib/stellar';
+import { TransactionTimeoutError, RETRY_FEE_MULTIPLIER } from '@/lib/stellar';
+import { sponsorshipAvailable, SPONSOR_MAX_AMOUNT } from '@/lib/sponsorship';
 import { useWallet } from '@/lib/wallet';
+import { SavedPatientControls } from '@/components/SavedPatientControls';
+import { useLocaleContext } from '@/i18n/LocaleContext';
+import { Sep7FundPanel } from '@/components/Sep7FundPanel';
 import { TestUsdc } from '@/components/TestUsdc';
 import { CopyValue } from '@/components/CopyValue';
 import { useToast } from '@/components/Toast';
+import { setTransactionStatus, useTransactionStatus } from '@/lib/pending-tx';
 import { Alert, Button, Card, ExplorerLink, Field } from '@/components/ui';
-
-/** How long the patient has to attend before the funder can refund. */
-const EXPIRY_OPTIONS = [14, 30, 60, 90] as const;
+import { SkeletonDetail } from '@/components/Skeleton';
+import { FavouriteButton } from '@/components/FavouriteButton';
+import { ClinicMetadataLink } from '@/components/ClinicMetadataLink';
+import { clinicMetadataUrl } from '@/lib/clinic-metadata';
 
 /**
  * Registry status in the words a funder reads. A funder choosing a clinic
@@ -50,18 +81,48 @@ const UNKNOWN_STATUS = {
   className: 'bg-slate-100 text-slate-600 ring-slate-200',
 };
 
+function isValidAddress(value: string): boolean {
+  return StrKey.isValidEd25519PublicKey(value);
+}
+
 export default function ClinicPage({
   params,
 }: {
   params: Promise<{ address: string }>;
 }) {
   const { address } = use(params);
+  const { t } = useLocaleContext();
   const { address: wallet, signTransaction, connect } = useWallet();
+  const searchParams = useSearchParams();
 
-  const { provider, error: loadError } = useProvider(address);
-  const [selectedOverride, setSelectedOverride] = useState<Service | null>(null);
+  // Validate the route parameter before it reaches any API or contract call.
+  if (!isValidAddress(address)) notFound();
+
+  const { provider, error: loadError, rawError: loadRawError } = useProvider(address);
+  const serviceParam = searchParams.get('service');
+  const prefilledServiceCode = serviceParam && /^\d+$/.test(serviceParam)
+    ? Number(serviceParam)
+    : null;
+  const prefilledService = provider?.services.find(
+    (service) => service.code === prefilledServiceCode && service.active !== false,
+  );
+  // Until the funder changes the basket, the clinic's first active service
+  // is selected, as before baskets existed: most funders pay for one thing.
+  const [selectedCodesOverride, setSelectedCodesOverride] = useState<number[] | null>(null);
   const firstActive = provider?.services.find((s) => s.active !== false) ?? null;
-  const selected = selectedOverride ?? firstActive;
+  const selectedCodes = useMemo(
+    () =>
+      selectedCodesOverride ??
+      (prefilledService ? [prefilledService.code] : firstActive ? [firstActive.code] : []),
+    [selectedCodesOverride, prefilledService, firstActive],
+  );
+  const setSelectedCodes = (update: (current: number[]) => number[]) =>
+    setSelectedCodesOverride(update(selectedCodes));
+  const selectedServices = useMemo(() => {
+    if (!provider) return [] as Service[];
+    return provider.services.filter((service) => selectedCodes.includes(service.code));
+  }, [provider, selectedCodes]);
+  const selected = selectedServices.length === 1 ? selectedServices[0] : null;
 
   const saved = useSavedIdentity();
   // null until the user types, so the saved values show through.
@@ -70,11 +131,128 @@ export default function ClinicPage({
   const identifier = identifierDraft ?? saved.identifier;
   const secret = secretDraft ?? saved.key;
   const [amountOverride, setAmountOverride] = useState<string | null>(null);
-  const amount = amountOverride ?? (selected ? toAmountInput(selected.price) : '');
-  const [expiryDays, setExpiryDays] = useState<number>(30);
+
+  const [existingDraftOnMount] = useState<CheckoutDraft | null>(() => {
+    if (typeof window === 'undefined') return null;
+    return loadCheckoutDraft(address);
+  });
+  const [draftDismissed, setDraftDismissed] = useState(false);
+  const isDraftVisible = Boolean(
+    existingDraftOnMount &&
+      existingDraftOnMount.selectedCodes.length > 0 &&
+      !draftDismissed,
+  );
+
+  const restoreDraft = () => {
+    if (!existingDraftOnMount) return;
+    setSelectedCodesOverride(existingDraftOnMount.selectedCodes);
+    setAmountOverride(existingDraftOnMount.amountOverride);
+    setExpiryChoice(existingDraftOnMount.expiryChoice);
+    setCustomExpiry(existingDraftOnMount.customExpiry);
+    if (existingDraftOnMount.patientNickname) {
+      void localIdentity.select(existingDraftOnMount.patientNickname);
+    }
+    setDraftDismissed(true);
+    toast.success(t('checkoutDraft.restoredMessage'));
+  };
+
+  const discardDraft = () => {
+    setDraftDismissed(true);
+    clearCheckoutDraft(address);
+  };
+  const selectionTotal = useMemo(
+    () =>
+      selectedServices.reduce(
+        (total, service) => total + BigInt(service.price),
+        0n,
+      ),
+    [selectedServices],
+  );
+    const requestedAmount =
+      selected && prefilledServiceCode === selected.code
+        ? searchParams.get('amount')
+        : null;
+    const validPrefilledAmount =
+      selected &&
+      requestedAmount !== null &&
+      validateAmountInput(requestedAmount, BigInt(selected.price)) === null
+        ? requestedAmount
+        : null;
+  const amount =
+    amountOverride ??
+    (selected
+        ? validPrefilledAmount ?? toAmountInput(selected.price)
+      : selectedServices.length > 0
+        ? toAmountInput(String(selectionTotal))
+        : '');
+  const amountMinimum = selected ? BigInt(selected.price) : selectionTotal;
+  const amountError =
+    selectedServices.length > 0 ? validateAmountInput(amount, amountMinimum) : null;
+  const [walletBalance, setWalletBalance] = useState<bigint | null>(null);
+  const [expiryChoice, setExpiryChoice] = useState<ExpiryChoice>(30);
+  const [customExpiry, setCustomExpiry] = useState('');
   const [generatedKey, setGeneratedKey] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  const [sponsored, setSponsored] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [xlmSwapQuote, setXlmSwapQuote] = useState<Awaited<
+    ReturnType<typeof quoteXlmForUsdc>
+  > | null>(null);
+  const [batchProgress, setBatchProgress] = useState<{
+    current: number;
+    total: number;
+    label: string;
+  } | null>(null);
+  const [batchSummary, setBatchSummary] = useState<{
+    succeeded: string[];
+    failed: { label: string; error: string }[];
+  } | null>(null);
   const toast = useToast();
+  const txStatus = useTransactionStatus();
+
+  // The wallet's USDC trustline (#1): checked on connect, before the fund
+  // button is offered, so funding never dies at signing with a raw token
+  // error. `missing` swaps the fund button for a one-click fix.
+  const trustline = useUsdcTrustline();
+
+  useEffect(() => {
+    if (!address) return;
+    if (isDraftVisible) return;
+
+    if (selectedCodes.length > 0) {
+      saveCheckoutDraft(address, {
+        selectedCodes,
+        amountOverride,
+        expiryChoice,
+        customExpiry,
+        patientNickname: saved.selectedNickname,
+      });
+    }
+  }, [
+    address,
+    selectedCodes,
+    amountOverride,
+    expiryChoice,
+    customExpiry,
+    saved.selectedNickname,
+    isDraftVisible,
+  ]);
+
+  useEffect(() => {
+    if (!wallet) return;
+    let ignore = false;
+    (async () => {
+      try {
+        const balance = await usdc.balance(wallet);
+        if (!ignore) setWalletBalance(balance);
+      } catch {
+        if (!ignore) setWalletBalance(null);
+      }
+    })();
+    return () => {
+      ignore = true;
+    };
+  }, [wallet]);
 
   // Track record for funders: how many vouchers this clinic has settled. The
   // count is filtered server-side, so it stays right as the list grows, and
@@ -87,14 +265,29 @@ export default function ClinicPage({
   } = useVouchers({ provider: address, status: 'Settled', limit: 1 });
 
   // The amount as base units, or null while the field is not a number.
+  // Taken from `amount` — the typed override for a single service, the
+  // basket total otherwise (the field is read-only there) — because that is
+  // exactly what `fund()` signs: the quote, the review screen, the balance
+  // warning and the disabled state must all describe the same number.
   const baseAmount = useMemo(() => {
+    if (selectedServices.length > 1) return selectionTotal;
     try {
       const v = toBaseUnits(amount);
       return v > 0n ? v : null;
     } catch {
       return null;
     }
-  }, [amount]);
+  }, [amount, selectedServices.length, selectionTotal]);
+
+  function toggleService(service: Service) {
+    setSelectedCodes((current) => {
+      const exists = current.includes(service.code);
+      if (exists) return current.filter((code) => code !== service.code);
+      return [...current, service.code];
+    });
+    setAmountOverride(null);
+    setBatchSummary(null);
+  }
 
   // What the clinic actually receives, read from the contract so the fee
   // shown is the fee charged. Kept with the amount it was quoted for, so a
@@ -117,76 +310,347 @@ export default function ClinicPage({
     };
   }, [baseAmount]);
   const currentQuote = quote && quote.amount === baseAmount ? quote : null;
+  const canSwapWithXlm = isTestnet && Boolean(config.usdcIssuer);
+  const fundingExpiresAt = expiresAtFor(expiryChoice, customExpiry);
+
+  const feeRequestKey =
+    wallet && baseAmount !== null && !amountError && selectedServices.length > 0
+      ? `${wallet}:${selectedServices.map((service) => `${service.code}:${selectedServices.length === 1 ? baseAmount : service.price}`).join(',')}:${expiryChoice}:${customExpiry}`
+      : null;
+  const [networkFee, setNetworkFee] = useState<{
+    key: string;
+    fee: bigint | null;
+    failed: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!wallet || !feeRequestKey || baseAmount === null) return;
+
+    let ignore = false;
+    const timer = setTimeout(async () => {
+      try {
+        const expiresAt = expiresAtFor(expiryChoice, customExpiry);
+        if (expiresAt === null) {
+          setNetworkFee({ key: feeRequestKey, fee: null, failed: true });
+          return;
+        }
+        const estimates = await Promise.all(
+          selectedServices.map((service) =>
+            voucher.estimateCreateFee({
+              funder: wallet,
+              beneficiaryRef: '00'.repeat(32),
+              provider: address,
+              serviceCode: service.code,
+              amount:
+                selectedServices.length === 1 ? baseAmount : BigInt(service.price),
+              expiresAt,
+            }),
+          ),
+        );
+        if (!ignore) {
+          setNetworkFee({
+            key: feeRequestKey,
+            fee: estimates.reduce((total, estimate) => total + estimate, 0n),
+            failed: false,
+          });
+        }
+      } catch {
+        if (!ignore) setNetworkFee({ key: feeRequestKey, fee: null, failed: true });
+      }
+    }, 350);
+
+    return () => {
+      ignore = true;
+      clearTimeout(timer);
+    };
+  }, [address, baseAmount, customExpiry, expiryChoice, feeRequestKey, selectedServices, wallet]);
+
+  const currentNetworkFee = networkFee?.key === feeRequestKey ? networkFee : null;
+  const networkFeeText = !wallet
+    ? 'Connect wallet to estimate'
+    : !feeRequestKey
+      ? 'Enter a valid amount to estimate'
+      : currentNetworkFee?.failed
+        ? 'Estimate unavailable'
+        : currentNetworkFee?.fee !== null && currentNetworkFee?.fee !== undefined
+          ? `${formatXlm(currentNetworkFee.fee)} XLM`
+          : 'Estimating…';
+
+  useEffect(() => {
+    let ignore = false;
+
+    async function loadQuote() {
+      if (!wallet || !selected || baseAmount === null || !canSwapWithXlm) {
+        if (!ignore) setXlmSwapQuote(null);
+        return;
+      }
+
+      try {
+        const balance = await usdc.balance(wallet).catch(() => 0n);
+        if (balance >= baseAmount) {
+          if (!ignore) setXlmSwapQuote(null);
+          return;
+        }
+        const nextQuote = await quoteXlmForUsdc(baseAmount - balance, 100);
+        if (!ignore) setXlmSwapQuote(nextQuote);
+      } catch {
+        if (!ignore) setXlmSwapQuote(null);
+      }
+    }
+
+    void loadQuote();
+    return () => {
+      ignore = true;
+    };
+  }, [baseAmount, canSwapWithXlm, selected, wallet]);
+
+  const reviewAmount = baseAmount === null ? '—' : formatUsdc(baseAmount);
+  const reviewFee = currentQuote ? formatUsdc(currentQuote.fee) : '—';
+  const reviewNet = currentQuote ? formatUsdc(currentQuote.net) : '—';
+  const insufficientUsdcBalance =
+    wallet !== null &&
+    baseAmount !== null &&
+    walletBalance !== null &&
+    walletBalance < baseAmount;
+  const missingUsdcForFunding =
+    wallet !== null && baseAmount !== null && walletBalance !== null && insufficientUsdcBalance;
+  const usdcShortfall =
+    missingUsdcForFunding ? baseAmount - walletBalance : null;
+  let sponsorAmount = 0n;
+  try {
+    sponsorAmount = toBaseUnits(amount);
+  } catch {
+    // Incomplete/invalid amounts cannot opt into sponsorship.
+  }
+  const canSponsor = sponsorshipAvailable() && selectedServices.length === 1 &&
+    sponsorAmount > 0n && sponsorAmount <= SPONSOR_MAX_AMOUNT &&
+    walletBalance !== null && walletBalance >= sponsorAmount;
+  const useSponsor = sponsored;
+  const maskedSecret = secret
+    ? secret.length <= 8
+      ? '••••'
+      : `${secret.slice(0, 4)}••••${secret.slice(-4)}`
+    : '—';
+
+  // A custom expiry is described by the date it resolves to, so the funder
+  // reads the voucher's last valid day rather than the picker's raw value.
+  const customExpiresAt =
+    expiryChoice === 'custom' ? expiresAtFor('custom', customExpiry) : null;
+  const expirySummary =
+    expiryChoice === 'custom'
+      ? customExpiresAt === null
+        ? 'the end of the date you choose'
+        : `the end of ${formatDate(new Date(customExpiresAt * 1000))}`
+      : `${expiryChoice} days`;
 
   async function fund() {
     if (!wallet) return void connect();
-    if (!selected) return;
+    if (selectedServices.length === 0) return;
+    if (useSponsor && !canSponsor) {
+      toast.error('Sponsored funding requires one voucher up to 100 USDC and enough USDC in your wallet.');
+      return;
+    }
+
+    // Belt and braces: the review screen and the fund button are both hidden
+    // without a trustline, but funding a wallet that cannot hold USDC would
+    // only fail at signing.
+    if (trustline.status === 'missing') return;
+
+    // A preset window is counted from now; a custom date is the last second
+    // of the day the funder picked. Checked once, before anything is signed,
+    // and shared by every voucher in the basket.
+    const expiresAt = expiresAtFor(expiryChoice, customExpiry);
+    if (expiresAt === null) {
+      toast.error('Choose the date the patient must attend by.');
+      return;
+    }
+    if (expiresAt <= Math.floor(Date.now() / 1000)) {
+      toast.error('The expiry date must be in the future.');
+      return;
+    }
+
+    // One service: the funder may pay above the listed price, never below.
+    // A basket of several funds each service at its listed price.
+    let singleAmount: bigint | null = null;
+    if (selected) {
+      if (amountError) {
+        toast.error(amountError);
+        return;
+      }
+      singleAmount = toBaseUnits(amount);
+    }
 
     setBusy(true);
+    setBatchSummary(null);
+    const requests = selectedServices.map((service) => ({
+      funder: wallet,
+      beneficiaryRef: identifier,
+      provider: address,
+      serviceCode: service.code,
+      amount: singleAmount ?? BigInt(service.price),
+      expiresAt,
+    }));
+
+    const succeeded: string[] = [];
+    const successfulTxs: { hash: string; id: string | null }[] = [];
+    const failed: { label: string; error: string }[] = [];
+
     try {
       const ref = await beneficiaryRef(identifier, secret);
-      localIdentity.save(identifier, secret);
+      await localIdentity.save(saved.selectedNickname || 'Saved patient', identifier, secret);
 
-      const base = toBaseUnits(amount);
-      if (base < BigInt(selected.price)) {
-        throw new Error(
-          `The listed price is $${formatUsdc(selected.price)}. Enter at least that.`,
-        );
+      const wrappedSign = async (
+        xdr: string,
+        context?: RestoreFootprintSignContext,
+      ) => {
+        setTransactionStatus('signing');
+        const signed = await signTransaction(xdr, context);
+        setTransactionStatus('submitting');
+        return signed;
+      };
+
+      for (let i = 0; i < requests.length; i++) {
+        const request = { ...requests[i], beneficiaryRef: ref };
+        setBatchProgress({
+          current: i + 1,
+          total: requests.length,
+          label: selectedServices[i].label,
+        });
+
+        try {
+          // A single voucher the wallet cannot cover in USDC buys the rest
+          // with XLM in the same transaction (#27); a basket uses USDC only.
+          let missingUsdc = 0n;
+          if (requests.length === 1 && canSwapWithXlm) {
+            const held = await usdc.balance(wallet).catch(() => 0n);
+            if (held < request.amount) missingUsdc = request.amount - held;
+          }
+          if (useSponsor && missingUsdc > 0n) {
+            throw new Error('Sponsored funding requires enough USDC; XLM swaps are not sponsored.');
+          }
+          setTransactionStatus('signing');
+          const res =
+            missingUsdc > 0n
+              ? await voucher.createWithXlmSwap(
+                  { ...request, swapAmount: missingUsdc },
+                  wrappedSign,
+                  100,
+                )
+              : await voucher.create(request, wrappedSign, useSponsor);
+          setTransactionStatus('confirming');
+          const balance = await usdc.balance(wallet).catch(() => null);
+          if (balance !== null) setWalletBalance(balance);
+
+          let newId: string | null = null;
+          if (typeof res.returnValue === 'bigint' || typeof res.returnValue === 'number') {
+            newId = String(res.returnValue);
+            succeeded.push(newId);
+            successfulTxs.push({ hash: res.hash, id: newId });
+            void invalidateVouchers(newId);
+          } else {
+            successfulTxs.push({ hash: res.hash, id: null });
+            void invalidateVouchers();
+          }
+          trackEvent('voucher_funded');
+        } catch (err) {
+          // A timed-out transaction may still land on chain. If it has not,
+          // offer to resubmit with a higher fee using the same sequence
+          // number — only one transaction per sequence number can be
+          // included, so the first attempt cannot also succeed (#316).
+          if (err instanceof TransactionTimeoutError) {
+            const retryFee = BigInt(Number(BASE_FEE) * RETRY_FEE_MULTIPLIER);
+            try {
+              const retry = await voucher.create(
+                { ...request },
+                signTransaction,
+                false,
+                retryFee,
+              );
+              const balance = await usdc.balance(wallet).catch(() => null);
+              if (balance !== null) setWalletBalance(balance);
+              let newId: string | null = null;
+              if (typeof retry.returnValue === 'bigint' || typeof retry.returnValue === 'number') {
+                newId = String(retry.returnValue);
+                succeeded.push(newId);
+                successfulTxs.push({ hash: retry.hash, id: newId });
+                void invalidateVouchers(newId);
+              } else {
+                successfulTxs.push({ hash: retry.hash, id: null });
+                void invalidateVouchers();
+              }
+              trackEvent('voucher_funded');
+              continue;
+            } catch (retryErr) {
+              failed.push({
+                label: selectedServices[i].label,
+                error: humaniseError(retryErr, VOUCHER_ERRORS),
+              });
+            }
+          }
+
+          failed.push({
+            label: selectedServices[i].label,
+            error: humaniseError(err, VOUCHER_ERRORS),
+          });
+          setBatchProgress(null);
+          setBatchSummary({ succeeded, failed });
+          toast.error(
+            `Funded ${succeeded.length} of ${requests.length} service${requests.length === 1 ? '' : 's'} before ${selectedServices[i].label} failed: ${failed[failed.length - 1].error}`,
+          );
+          return;
+        }
       }
 
-      const expiresAt = Math.floor(Date.now() / 1000) + expiryDays * 24 * 60 * 60;
-
-      const res = await voucher.create(
-        {
-          funder: wallet,
-          beneficiaryRef: ref,
-          provider: address,
-          serviceCode: selected.code,
-          amount: base,
-          expiresAt,
-        },
-        signTransaction,
-      );
-      // create_voucher returns the new id as a u64.
-      let newId: string | null = null;
-      if (typeof res.returnValue === 'bigint' || typeof res.returnValue === 'number') {
-        newId = String(res.returnValue);
-        void invalidateVouchers(newId);
-      } else {
-        void invalidateVouchers();
+      setReviewing(false);
+      setBatchProgress(null);
+      setBatchSummary({ succeeded, failed });
+      if (succeeded.length > 0) {
+        clearCheckoutDraft(address);
+        setDraftDismissed(true);
       }
-      trackEvent('voucher_funded');
+      const firstId = succeeded[0];
+      const lastHash = successfulTxs.at(-1)?.hash ?? null;
       toast.success(
         <>
-          Voucher funded.{' '}
-          {newId && (
+          {requests.length === 1 ? 'Voucher funded.' : `${succeeded.length} vouchers funded.`}
+          {firstId && (
             <>
-              <Link href={`/vouchers/${newId}`} className="underline underline-offset-2">
-                Open voucher #{newId}
-              </Link>{' '}
+              {' '}
+              <DetailLink detail={{ kind: 'voucher', id: firstId }} className="underline underline-offset-2">
+                Open voucher #{firstId}
+              </DetailLink>
+              {' '}
               ·{' '}
             </>
           )}
-          <ExplorerLink href={explorerTx(res.hash)}>View transaction</ExplorerLink>
+          {lastHash && <ExplorerLink href={explorerTx(lastHash)}>View transaction</ExplorerLink>}
         </>,
       );
     } catch (err) {
-      toast.error(humaniseError(err, VOUCHER_ERRORS));
+      const message = humaniseError(err, VOUCHER_ERRORS);
+      setBatchProgress(null);
+      setBatchSummary({ succeeded, failed: [{ label: 'Funding', error: message }] });
+      toast.error(message);
     } finally {
       setBusy(false);
+      setTransactionStatus('idle');
     }
   }
 
+  // An unknown clinic is a missing page, not an API failure.
+  if (loadRawError instanceof ApiError && loadRawError.status === 404) notFound();
   if (loadError) return <Alert>{loadError}</Alert>;
   if (!provider) {
-    return <p className="text-sm text-[var(--color-ink-soft)]">Loading clinic…</p>;
+    return <SkeletonDetail />;
   }
 
   const status = STATUS_BADGES[provider.status] ?? UNKNOWN_STATUS;
-  const registeredAt = Number.isFinite(Date.parse(provider.registeredAt))
+  const registeredAt = Number.isFinite(new Date(provider.registeredAt).getTime())
     ? provider.registeredAt
     : null;
   const showSettled = !loadingSettled && !settledError;
+  const websiteUrl = clinicMetadataUrl(provider.metadata?.website);
+  const contactUrl = clinicMetadataUrl(provider.metadata?.contact);
 
   return (
     <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
@@ -197,14 +661,21 @@ export default function ClinicPage({
               <h1 className="text-2xl font-semibold tracking-tight">{provider.name}</h1>
               <p className="mono mt-1 text-xs text-[var(--color-ink-soft)]">
                 {provider.country} ·{' '}
-                <CopyValue value={provider.address} chars={8} label="clinic address" />
+                <CopyValue
+                  value={provider.address}
+                  chars={8}
+                  label={t('components.copyValue.labels.clinicAddress')}
+                />
               </p>
             </div>
-            <span
-              className={`inline-flex shrink-0 rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset ${status.className}`}
-            >
-              {status.label}
-            </span>
+            <div className="flex items-center gap-2">
+              <FavouriteButton address={provider.address} clinicName={provider.name} />
+              <span
+                className={`inline-flex shrink-0 rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset ${status.className}`}
+              >
+                {status.label}
+              </span>
+            </div>
           </div>
 
           {(registeredAt || showSettled) && (
@@ -227,31 +698,55 @@ export default function ClinicPage({
               )}
             </dl>
           )}
+
+          {(websiteUrl || contactUrl) && (
+            <div className="mt-4 grid gap-2 border-t border-[var(--color-line)] pt-4 sm:grid-cols-2">
+              <ClinicMetadataLink
+                label={t('clinic.website')}
+                destination={websiteUrl}
+              />
+              <ClinicMetadataLink
+                label={t('clinic.contact')}
+                destination={contactUrl}
+              />
+            </div>
+          )}
         </Card>
 
         <Card className="divide-y divide-[var(--color-line)]">
           {provider.services
             .filter((s) => s.active !== false)
-            .map((s) => (
-              <button
-                key={s.code}
-                onClick={() => {
-                  setSelectedOverride(s);
-                  setAmountOverride(toAmountInput(s.price));
-                }}
-                className={`flex w-full items-center justify-between px-5 py-4 text-left transition hover:bg-[var(--color-canvas)] ${
-                  selected?.code === s.code ? 'bg-[var(--color-brand-soft)]/40' : ''
-                }`}
-              >
-                <div>
-                  <div className="text-sm font-medium">{s.label}</div>
-                  <div className="text-xs text-[var(--color-ink-soft)]">
-                    Service code {s.code}
+            .map((s) => {
+              const checked = selectedCodes.includes(s.code);
+              return (
+                <button
+                  key={s.code}
+                  onClick={() => toggleService(s)}
+                  className={`flex w-full items-center justify-between px-5 py-4 text-start transition hover:bg-[var(--color-canvas)] ${
+                    checked ? 'bg-[var(--color-brand-soft)]/40' : ''
+                  }`}
+                >
+                  <div className="flex items-center gap-3">
+                    <span
+                      className={`inline-flex h-5 w-5 items-center justify-center rounded border text-[10px] font-bold ${
+                        checked
+                          ? 'border-[var(--color-brand)] bg-[var(--color-brand)] text-[var(--color-brand-text)]'
+                          : 'border-[var(--color-line)] bg-[var(--color-surface)] text-transparent'
+                      }`}
+                    >
+                      ✓
+                    </span>
+                    <div>
+                      <div className="text-sm font-medium">{s.label}</div>
+                      <div className="text-xs text-[var(--color-ink-soft)]">
+                        Service code {s.code}
+                      </div>
+                    </div>
                   </div>
-                </div>
-                <div className="mono text-sm">${formatUsdc(s.price)}</div>
-              </button>
-            ))}
+                  <div className="mono text-sm">${formatUsdc(s.price)}</div>
+                </button>
+              );
+            })}
           {provider.services.length === 0 && (
             <p className="px-5 py-6 text-sm text-[var(--color-ink-soft)]">
               This clinic has not listed any services yet.
@@ -263,17 +758,101 @@ export default function ClinicPage({
       <Card className="h-fit space-y-4 p-5">
         <h2 className="font-medium">Fund care</h2>
 
-        {!selected && (
+        {isDraftVisible && existingDraftOnMount && (
+          <div
+            data-testid="checkout-draft-banner"
+            className="rounded-lg border border-[var(--color-brand)]/30 bg-[var(--color-brand-soft)]/20 p-3 text-sm space-y-2"
+          >
+            <div className="font-medium text-xs text-[var(--color-ink)]">
+              {t('checkoutDraft.foundTitle')}
+            </div>
+            <p className="text-xs text-[var(--color-ink-soft)]">
+              {t('checkoutDraft.foundDescription', {
+                count: existingDraftOnMount.selectedCodes.length,
+              })}
+            </p>
+            <div className="flex items-center gap-2 pt-1">
+              <Button onClick={restoreDraft}>
+                {t('checkoutDraft.restore')}
+              </Button>
+              <Button variant="ghost" onClick={discardDraft}>
+                {t('checkoutDraft.discard')}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {batchProgress && (
+          <div className="rounded-lg border border-[var(--color-line)] bg-[var(--color-surface)] p-3 text-sm">
+            <div className="flex items-center justify-between text-xs text-[var(--color-ink-soft)]">
+              <span>Funding {batchProgress.label}…</span>
+              <span className="mono font-medium">
+                {batchProgress.current} of {batchProgress.total}
+              </span>
+            </div>
+            <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-line)]">
+              <div
+                className="h-full bg-[var(--color-brand)] transition-all duration-300"
+                style={{
+                  width: `${(batchProgress.current / batchProgress.total) * 100}%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        {batchSummary && (
+          <div className="space-y-2">
+            {batchSummary.succeeded.length > 0 && (
+              <Alert kind="success">
+                Funded {batchSummary.succeeded.length} voucher
+                {batchSummary.succeeded.length === 1 ? '' : 's'} successfully (
+                {batchSummary.succeeded.map((id) => `#${id}`).join(', ')}).
+              </Alert>
+            )}
+            {batchSummary.failed.length > 0 && (
+              <Alert>
+                Failed to fund {batchSummary.failed.length} service
+                {batchSummary.failed.length === 1 ? '' : 's'}:{' '}
+                {batchSummary.failed
+                  .map((failure) => `${failure.label} (${failure.error})`)
+                  .join(', ')}.
+              </Alert>
+            )}
+          </div>
+        )}
+
+        {selectedServices.length === 0 && !reviewing && (
           <p className="text-sm text-[var(--color-ink-soft)]">
-            Choose a service to fund.
+            Choose one or more services to fund.
           </p>
         )}
 
-        {selected && (
+        {selectedServices.length > 0 && !reviewing && (
           <>
-            <Field label="Service">
-              {selected.label} · ${formatUsdc(selected.price)}
+            <Field label="Selected services">
+              <div className="space-y-2">
+                {selectedServices.map((service) => (
+                  <div key={service.code} className="flex items-center justify-between gap-3">
+                    <span className="text-sm">{service.label}</span>
+                    <span className="mono text-sm">${formatUsdc(service.price)}</span>
+                  </div>
+                ))}
+                <div className="flex items-center justify-between gap-3 border-t border-[var(--color-line)] pt-2 text-sm font-medium">
+                  <span>Total</span>
+                  <span className="mono">${formatUsdc(selectionTotal)}</span>
+                </div>
+              </div>
             </Field>
+
+            <SavedPatientControls
+              identifier={identifier}
+              keyValue={secret}
+              onSelect={(patient) => {
+                setIdentifier(patient?.identifier ?? '');
+                setSecret(patient?.key ?? '');
+              }}
+            />
 
             <label className="block">
               <span className="text-xs uppercase tracking-wide text-[var(--color-ink-soft)]">
@@ -320,9 +899,9 @@ export default function ClinicPage({
 
             {generatedKey && (
               <Alert kind="info">
-                Save this key somewhere safe and share it with the patient or their
-                clinic. It is the only way to look up this patient&apos;s care history
-                later, and it cannot be recovered.
+                This key is the only way to look up this patient&apos;s care history
+                later. Save the patient on this browser or keep a separate backup;
+                the key cannot be recovered.
               </Alert>
             )}
 
@@ -334,12 +913,54 @@ export default function ClinicPage({
                 value={amount}
                 onChange={(e) => setAmountOverride(e.target.value)}
                 inputMode="decimal"
-                className="mono mt-1 w-full rounded-lg border border-[var(--color-line)] px-3 py-2 text-sm"
+                readOnly={selectedServices.length > 1}
+                aria-invalid={Boolean(amountError)}
+                aria-describedby={amountError ? 'clinic-amount-error' : undefined}
+                className={`mono mt-1 w-full rounded-lg border px-3 py-2 text-sm ${amountError ? 'border-red-500' : 'border-[var(--color-line)]'}`}
               />
+              {amountError ? (
+                <span id="clinic-amount-error" className="mt-1 block text-xs text-red-600">
+                  {amountError}
+                </span>
+              ) : selectedServices.length > 0 ? (
+                <span className="mt-1 block text-xs text-[var(--color-ink-soft)]">
+                  Minimum ${formatUsdc(amountMinimum)}. Up to 7 decimal places.
+                </span>
+              ) : null}
+              <div className="mt-2 flex items-center justify-between gap-3 text-xs">
+                <span className="text-[var(--color-ink-soft)]">
+                  Wallet USDC balance:{' '}
+                  {wallet ? (
+                    walletBalance === null ? '—' : `$${formatUsdc(walletBalance)}`
+                  ) : (
+                    'Connect wallet'
+                  )}
+                </span>
+                {usdcShortfall !== null && (
+                  <span className="font-medium text-red-600">
+                    Need ${formatUsdc(usdcShortfall)} more
+                  </span>
+                )}
+              </div>
               {currentQuote && (
                 <span className="mt-1 block text-xs text-[var(--color-ink-soft)]">
                   Clinic receives ${formatUsdc(currentQuote.net)} after a $
                   {formatUsdc(currentQuote.fee)} protocol fee. Refunds are free.
+                </span>
+              )}
+              <span role="status" className="mt-1 block text-xs text-[var(--color-ink-soft)]">
+                Estimated network fee: {networkFeeText}
+              </span>
+              {xlmSwapQuote && (
+                <span className="mt-2 block rounded-lg border border-amber-300/70 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                  XLM swap: {formatXlm(xlmSwapQuote.xlmCost)} XLM quoted to buy{' '}
+                  {formatUsdc(xlmSwapQuote.usdcAmount)} USDC, with a 1% slippage cap of{' '}
+                  {formatXlm(xlmSwapQuote.maxXlm)} XLM before the transaction aborts.
+                </span>
+              )}
+              {!xlmSwapQuote && insufficientUsdcBalance && (
+                <span className="mt-2 block text-xs text-red-600">
+                  Not enough USDC in your wallet for this. You need ${formatUsdc(usdcShortfall ?? 0n)} more.
                 </span>
               )}
             </label>
@@ -349,8 +970,8 @@ export default function ClinicPage({
                 Patient must attend within
               </span>
               <select
-                value={expiryDays}
-                onChange={(e) => setExpiryDays(Number(e.target.value))}
+                value={expiryChoice}
+                onChange={(e) => setExpiryChoice(e.target.value as ExpiryChoice)}
                 className="mt-1 w-full rounded-lg border border-[var(--color-line)] bg-[var(--color-surface)] px-3 py-2 text-sm"
               >
                 {EXPIRY_OPTIONS.map((d) => (
@@ -358,26 +979,239 @@ export default function ClinicPage({
                     {d} days
                   </option>
                 ))}
+                <option value="custom">Custom date</option>
               </select>
             </label>
 
+            {expiryChoice === 'custom' && (
+              <div>
+                <label className="block">
+                  <span className="text-xs uppercase tracking-wide text-[var(--color-ink-soft)]">
+                    Expiry date
+                  </span>
+                  <input
+                    type="date"
+                    value={customExpiry}
+                    min={minExpiryDate()}
+                    onChange={(e) => setCustomExpiry(e.target.value)}
+                    className="mt-1 w-full rounded-lg border border-[var(--color-line)] px-3 py-2 text-sm"
+                  />
+                </label>
+                <span className="mt-1 block text-xs text-[var(--color-ink-soft)]">
+                  The voucher is valid through this date (UTC). The contract
+                  accepts any date in the future.
+                </span>
+              </div>
+            )}
+
+            {/* The faucet card's own trustline instructions would talk over
+                the one-click prompt below, so it stays out of the way here. */}
+            <TestUsdc compact trustlineHint={false} />
+
+            {trustline.status === 'missing' && (
+              <Alert kind="info">
+                <p>
+                  A trustline is your wallet agreeing to hold USDC — press{' '}
+                  <strong>Add USDC</strong> and approve the one-time request in
+                  your wallet.
+                </p>
+                <Button
+                  className="mt-3"
+                  disabled={trustline.adding}
+                  onClick={() => void trustline.add()}
+                >
+                  {trustline.adding ? 'Check your wallet…' : 'Add USDC'}
+                </Button>
+              </Alert>
+            )}
+            {sponsorshipAvailable() && (
+              <div className="space-y-2 text-sm">
+                <label className="flex items-start gap-2">
+                  <input type="checkbox" checked={useSponsor} disabled={(!canSponsor && !sponsored) || busy}
+                    onChange={(event) => setSponsored(event.target.checked)} />
+                  <span>Request sponsored fees (first voucher)</span>
+                </label>
+                <p className="text-xs text-[var(--color-ink-soft)]">
+                  Testnet only: one voucher up to 100 USDC, with fees up to 1 XLM.
+                  You still need an active account and enough USDC. The sponsor checks
+                  eligibility. If declined, you can turn this off to pay fees with XLM.
+                </p>
+              </div>
+            )}
+
             <TestUsdc compact />
 
-            <Button onClick={() => void fund()} disabled={busy} className="w-full">
-              {busy ? 'Confirming…' : wallet ? 'Fund voucher' : 'Connect wallet'}
-            </Button>
+            {trustline.status === 'ready' && trustline.balance !== null && (
+              <p className="text-sm">
+                USDC balance:{' '}
+                <span className="mono font-medium">
+                  ${formatUsdc(trustline.balance)}
+                </span>
+              </p>
+            )}
+
+            {trustline.balance !== null &&
+              baseAmount !== null &&
+              trustline.balance < baseAmount && (
+                <Alert>
+                  Your USDC balance is ${formatUsdc(trustline.balance)}, below
+                  the ${formatUsdc(baseAmount)} voucher amount. Top up before
+                  funding.
+                </Alert>
+              )}
+
+            {trustline.status !== 'missing' && (
+              <Button
+                onClick={() => {
+                  if (!wallet) {
+                    connect();
+                    return;
+                  }
+                  setReviewing(true);
+                }}
+                disabled={
+                  busy || trustline.status === 'checking' || (insufficientUsdcBalance && !xlmSwapQuote)
+                }
+                className="w-full"
+              >
+                {busy
+                  ? txStatus === 'signing'
+                    ? t('common.signing')
+                    : txStatus === 'submitting'
+                      ? t('common.submitting')
+                      : t('common.confirming')
+                  : wallet
+                    ? xlmSwapQuote && selectedServices.length === 1
+                      ? 'Swap XLM & fund voucher'
+                      : `Fund ${selectedServices.length === 1 ? 'voucher' : `${selectedServices.length} vouchers`}`
+                    : 'Connect wallet'}
+              </Button>
+            )}
+
+            {selected && baseAmount !== null && !useSponsor && (
+              <Sep7FundPanel
+                amount={baseAmount}
+                expiresAt={fundingExpiresAt}
+                provider={address}
+                serviceCode={selected.code}
+                identifier={identifier}
+                secret={secret}
+                walletAddress={wallet}
+                onFunded={({ hash }) => {
+                  void invalidateVouchers();
+                  trackEvent('voucher_funded');
+                  toast.success(
+                    <>
+                      Voucher funded from a SEP-7 wallet.{' '}
+                      <ExplorerLink href={explorerTx(hash)}>View transaction</ExplorerLink>
+                    </>,
+                  );
+                }}
+              />
+            )}
 
             <p className="text-xs leading-relaxed text-[var(--color-ink-soft)]">
               Funds are escrowed by the contract at{' '}
               <CopyValue
                 value={config.contracts.voucher}
                 chars={4}
-                label="contract id"
+                label={t('components.copyValue.labels.contractId')}
               />{' '}
               and released to the clinic only after an attester confirms delivery.
-              Unclaimed vouchers are refundable after {expiryDays} days.
+              Unclaimed vouchers are refundable after {expirySummary}.
             </p>
           </>
+        )}
+
+        {selectedServices.length > 0 && reviewing && (
+          <div className="space-y-4">
+            <div>
+              <h3 className="text-lg font-medium">Review funding</h3>
+              <p className="mt-1 text-sm text-[var(--color-ink-soft)]">
+                Check the details below before signing{' '}
+                {selectedServices.length === 1 ? 'the voucher' : `${selectedServices.length} vouchers`}.
+              </p>
+            </div>
+
+            <dl className="space-y-3 rounded-xl border border-[var(--color-line)] bg-[var(--color-canvas)] p-4 text-sm">
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Clinic</dt>
+                <dd className="text-end font-medium">{provider.name}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Services</dt>
+                <dd className="text-end font-medium">
+                  {selectedServices
+                    .map((service) => `${service.label} · $${formatUsdc(service.price)}`)
+                    .join(', ')}
+                </dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Patient reference</dt>
+                <dd className="text-end font-medium">{identifier || 'Not set'}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Patient key</dt>
+                <dd className="mono text-end font-medium">{maskedSecret}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Amount</dt>
+                <dd className="mono text-end font-medium">${reviewAmount}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Protocol fee</dt>
+                <dd className="mono text-end font-medium">${reviewFee}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Network fee</dt>
+                <dd className="mono text-end font-medium">{networkFeeText}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Clinic payout</dt>
+                <dd className="mono text-end font-medium">${reviewNet}</dd>
+              </div>
+              {xlmSwapQuote && (
+                <div className="flex items-start justify-between gap-3">
+                  <dt className="text-[var(--color-ink-soft)]">Paid in XLM</dt>
+                  <dd className="mono text-end font-medium">
+                    up to {formatXlm(xlmSwapQuote.maxXlm)} XLM for {formatUsdc(xlmSwapQuote.usdcAmount)}{' '}
+                    USDC
+                  </dd>
+                </div>
+              )}
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-[var(--color-ink-soft)]">Expires</dt>
+                <dd className="text-end font-medium">{expirySummary}</dd>
+              </div>
+            </dl>
+
+            {useSponsor && (
+              <Alert kind="info">
+                Requesting sponsored transaction fees. Your signed funding transaction
+                is sent to the sponsor; your patient identifier and secret key stay here.
+                A declined request will not fall back to charging your XLM.
+              </Alert>
+            )}
+
+            <div className="flex gap-2">
+              <Button variant="ghost" className="flex-1" onClick={() => setReviewing(false)}>
+                Back
+              </Button>
+              <Button
+                className="flex-1"
+                onClick={() => void fund()}
+                disabled={busy || (insufficientUsdcBalance && !xlmSwapQuote)}
+              >
+                {busy
+                  ? txStatus === 'signing'
+                    ? t('common.signing')
+                    : txStatus === 'submitting'
+                      ? t('common.submitting')
+                      : t('common.confirming')
+                  : 'Confirm'}
+              </Button>
+            </div>
+          </div>
         )}
       </Card>
     </div>

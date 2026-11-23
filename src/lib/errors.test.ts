@@ -4,6 +4,7 @@ import {
   contractErrorCode,
   FAUCET_ERRORS,
   humaniseError,
+  humaniseHorizonResult,
   REGISTRY_ERRORS,
   VOUCHER_ERRORS,
 } from './errors';
@@ -84,6 +85,63 @@ describe('humaniseError', () => {
     const message = mainnet.humaniseError(new Error('account not found'));
     expect(message).not.toMatch(/Friendbot/);
     expect(message).toBe('This account does not exist on the network yet. Fund it first.');
+  });
+
+  it('supports French, Swahili and Yoruba translations', () => {
+    expect(humaniseError(new Error('Error(Contract, #4)'), VOUCHER_ERRORS, 'fr')).toBe(
+      "Ce bon d'achat n'existe pas.",
+    );
+    expect(humaniseError(new Error('Error(Contract, #4)'), VOUCHER_ERRORS, 'sw')).toBe(
+      'Vocha hiyo haipo.',
+    );
+    expect(humaniseError(new Error('Error(Contract, #4)'), VOUCHER_ERRORS, 'yo')).toBe(
+      'Vóṣà yẹn kò sí.',
+    );
+    expect(humaniseError(new Error('token trustline missing'), VOUCHER_ERRORS, 'fr')).toBe(
+      'Votre portefeuille nécessite une trustline USDC pour détenir ou envoyer des USDC.',
+    );
+    expect(humaniseError(new Error('token trustline missing'), VOUCHER_ERRORS, 'sw')).toBe(
+      'Pochi yako inahitaji trustline ya USDC kabla ya kupokea au kutuma USDC.',
+    );
+  });
+});
+
+/**
+ * Horizon's `extras.result_codes` for the classic changeTrust of #1: the
+ * only explanation a user gets when the network rejects it, so every code
+ * the operation can produce has to read as an instruction, not a code.
+ */
+describe('humaniseHorizonResult', () => {
+  it('turns the reserve failure into a top-up instruction', () => {
+    expect(
+      humaniseHorizonResult(400, {
+        tx: 'tx_failed',
+        operations: ['op_underfunded'],
+      }),
+    ).toMatch(/Not enough XLM: .*reserve/);
+  });
+
+  it('prefers the operation code over the transaction code', () => {
+    // op_line_full and tx_failed must not collapse into a generic retry.
+    expect(
+      humaniseHorizonResult(400, { tx: 'tx_failed', operations: ['op_line_full'] }),
+    ).toBe('Your wallet already holds all the USDC this issuer allows.');
+  });
+
+  it('shows an unknown code verbatim rather than swallowing it', () => {
+    expect(humaniseHorizonResult(400, { operations: ['op_weird_new_code'] })).toBe(
+      'The network rejected this request (op_weird_new_code). Try again.',
+    );
+  });
+
+  it('says the request may still be in flight on a Horizon timeout', () => {
+    expect(humaniseHorizonResult(504, null)).toMatch(/may still/);
+  });
+
+  it('names the HTTP status when there are no result codes at all', () => {
+    expect(humaniseHorizonResult(500, undefined)).toBe(
+      'The Stellar network could not accept this request (HTTP 500). Try again.',
+    );
   });
 });
 
